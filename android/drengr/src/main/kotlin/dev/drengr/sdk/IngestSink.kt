@@ -14,20 +14,6 @@ import java.util.concurrent.TimeUnit
 import kotlin.math.min
 import kotlin.random.Random
 
-/**
- * Batches captured signals and ships them to the Drengr ingest endpoint,
- * authenticated by a publishable key. Port of the proven Dart/JS IngestSink,
- * carrying every device-run lesson from birth:
- *  - delivery uses a DEDICATED OkHttpClient with NO Drengr interceptor, so the
- *    sink can never capture its own POSTs (the self-capture loop can't exist);
- *  - the persist scheduler serializes writes on a single-thread executor, so no
- *    starvation loop is possible;
- *  - envelope carries sent_at_ms for server-side clock-skew correction.
- *
- * Best-effort and non-blocking: never throws into the app, drops oldest on
- * overflow, retries with exponential backoff + full jitter, persists the queue
- * to a JSONL file in the app's files dir so an app kill doesn't lose events.
- */
 internal class IngestSink(
     filesDir: File,
     private val url: String,
@@ -37,9 +23,6 @@ internal class IngestSink(
     private val maxQueue: Int = 500,
     private val flushIntervalMs: Long = 10_000,
 ) {
-    // A single-thread executor is the whole concurrency model: enqueue, flush,
-    // persist, and restore all run here, so the in-memory queue needs no locks
-    // and no write can overlap another (no starvation loop).
     private val exec: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "drengr-sink").apply { isDaemon = true }
     }
@@ -48,12 +31,9 @@ internal class IngestSink(
     private var flushScheduled = false
     private var retries = 0
 
-    // Session-scoped identity/experiment state, merged into every envelope (see flush()).
-    // Mutated only on `exec` (identify/setExperiment dispatch there), same as the queue.
     private var externalId: String? = null
     private val experiments = LinkedHashMap<String, String>()
 
-    // Delivery client: NO interceptor → structurally invisible to capture.
     private val delivery = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .callTimeout(30, TimeUnit.SECONDS)
@@ -68,8 +48,6 @@ internal class IngestSink(
         exec.execute { enqueue(ev) }
     }
 
-    /** Sets external_id (all events hereafter) and emits one identify event; traits
-     *  go through the same redact+project pipeline as bodies. Fail-open. */
     fun identify(externalId: String, traits: Map<String, Any?> = emptyMap()) {
         if (externalId.isEmpty()) return
         val redactedTraits = try {
@@ -90,8 +68,6 @@ internal class IngestSink(
         }
     }
 
-    /** Sets/clears a session-scoped experiment variant (all events hereafter, as
-     *  `experiments`). A null/empty variant clears the key. Fail-open. */
     fun setExperiment(key: String, variant: String?) {
         if (key.isEmpty()) return
         exec.execute {
@@ -157,8 +133,6 @@ internal class IngestSink(
                 .build()
             delivery.newCall(req).execute().use { resp ->
                 acked = resp.isSuccessful
-                // Non-retriable 4xx (revoked key 401, bad batch 400/413) never
-                // succeeds — retrying forever head-of-line-blocks the queue. Drop.
                 permanent = resp.code in 400..499 && resp.code != 429 && resp.code != 408
             }
         } catch (_: Throwable) {
@@ -166,11 +140,10 @@ internal class IngestSink(
         }
 
         if (acked || permanent) {
-            retries = 0 // batch consumed (delivered or dropped as permanent)
+            retries = 0
             schedulePersist()
             if (queue.isNotEmpty()) scheduleFlush()
         } else {
-            // Requeue at the front; shed newest on overflow.
             for (i in batch.indices.reversed()) queue.addFirst(batch[i])
             while (queue.size > maxQueue) queue.pollLast()
             schedulePersist()
@@ -186,9 +159,7 @@ internal class IngestSink(
         exec.schedule({ flush() }, delay, TimeUnit.MILLISECONDS)
     }
 
-    // --- persistence (serialized on exec; writer loops nothing — one write per tick) ---
     private fun schedulePersist() {
-        if (flushScheduled) { /* a flush is queued; persist will ride along */ }
         exec.execute { persist() }
     }
 
@@ -203,7 +174,7 @@ internal class IngestSink(
                 }
                 tmp.renameTo(file)
             }
-        } catch (_: Throwable) { /* best-effort */ }
+        } catch (_: Throwable) {}
     }
 
     private fun restore() {
@@ -215,7 +186,7 @@ internal class IngestSink(
                 }
             }
             if (queue.isNotEmpty()) scheduleFlush()
-        } catch (_: Throwable) { /* corrupt/missing → start empty */ }
+        } catch (_: Throwable) {}
     }
 
     private fun randomId(): String {

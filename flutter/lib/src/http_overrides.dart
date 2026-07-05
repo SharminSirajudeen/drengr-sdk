@@ -2,8 +2,6 @@ import 'dart:io';
 
 import 'capturing_http_client.dart';
 
-/// Installs a capturing [HttpClient] while preserving any pre-existing override
-/// (so we never clobber the tenant's own `HttpOverrides.global`).
 class DrengrHttpOverrides extends HttpOverrides {
   DrengrHttpOverrides(this._previous);
   final HttpOverrides? _previous;
@@ -15,7 +13,7 @@ class DrengrHttpOverrides extends HttpOverrides {
     try {
       return CapturingHttpClient(inner);
     } catch (_) {
-      return inner; // never break the app's networking
+      return inner;
     }
   }
 

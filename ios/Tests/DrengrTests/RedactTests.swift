@@ -1,7 +1,6 @@
 import XCTest
 @testable import Drengr
 
-/// Parity suite mirroring the Dart/JS/Kotlin redaction tests — same corpus, same masks.
 final class RedactTests: XCTestCase {
     func testSensitiveNames() {
         for n in ["password", "PWD", "api_key", "access-token", "creditCard", "email", "phoneNumber", "firstName"] {
@@ -36,13 +35,10 @@ final class RedactTests: XCTestCase {
     }
 
     func testSecretPrefixes() {
-        // opaque vendor secrets under a benign key/free text are scrubbed
         XCTAssertTrue(Redact.scrubValues("k=sk_live_abcdef0123456789ABCDEF").contains("REDACTED-SECRET"))
         XCTAssertTrue(Redact.scrubValues("AKIAIOSFODNN7EXAMPLE").contains("REDACTED-SECRET"))
         XCTAssertTrue(Redact.scrubValues("ghp_" + String(repeating: "a", count: 36)).contains("REDACTED-SECRET"))
-        // publishable keys are public by design — must NOT be nuked
         XCTAssertEqual(Redact.scrubValues("pk_live_51H8xYzPublishableKey"), "pk_live_51H8xYzPublishableKey")
-        // benign ids survive
         XCTAssertEqual(Redact.scrubValues("order_12345"), "order_12345")
     }
 
@@ -110,13 +106,10 @@ final class RedactTests: XCTestCase {
         XCTAssertTrue(b.contains("REDACTED-PAN"))
     }
 
-    // --- name-adjacent leaks: values sensitive by NAME only (no value pattern),
-    // in bodies that structural key-masking never reaches. Secrets must NOT appear.
-    private let pwd = "hunter2secret"      // plaintext password — no value pattern
-    private let addr = "221B Baker St"     // PII address — no value pattern
+    private let pwd = "hunter2secret"
+    private let addr = "221B Baker St"
 
     func testLeakTruncatedJSONDoubleQuoted() {
-        // JSON truncated past the size cap → unparseable → key-masking skipped.
         let b = Redact.redactBody(#"{"user":"bob","address":"221B Baker St","password":"hunter2secret""#)
         XCTAssertFalse(b.contains(pwd), b)
         XCTAssertFalse(b.contains(addr), b)
@@ -140,19 +133,14 @@ final class RedactTests: XCTestCase {
     }
 
     func testLeakJSONNumericUnderQuotedKey() {
-        // Short numeric secret under a sensitive key in a truncated body.
         let b = Redact.redactBody(#"{"amount":25,"otp":987654,"pin":1234"#)
         XCTAssertFalse(b.contains("987654"), b)
         XCTAssertFalse(b.contains("1234"), b)
-        XCTAssertTrue(b.contains("amount\":25"))  // benign numeric survives
+        XCTAssertTrue(b.contains("amount\":25"))
         XCTAssertTrue(b.contains("[REDACTED]"))
     }
 
     func testLeakGraphQLInlineLiteral() {
-        // Well-formed JSON wrapper; secrets are GraphQL inline literals inside the
-        // parsed `query` string, so structural key-masking never sees them. The
-        // value class stopping at any backslash/quote makes each name:\"value\"
-        // pair match innermost instead of the outer wrapper eating the whole span.
         let b = Redact.redactBody(#"{"query":"mutation { register(city:\"NYC\", password:\"hunter2secret\", address:\"221B Baker St\") }"}"#)
         XCTAssertFalse(b.contains(pwd), b)
         XCTAssertFalse(b.contains(addr), b)
@@ -160,16 +148,12 @@ final class RedactTests: XCTestCase {
     }
 
     func testLeakGraphQLFirstArg() {
-        // The secret is the FIRST inline literal right after the wrapper's opening
-        // quote — the escNamed (escaped-quote-anchored) pass masks it before the
-        // plain-quote wrapper pass can shadow it.
         let b = Redact.redactBody(#"{"query":"mutation { login(password:\"hunter2secret\", note:\"x\") }"}"#)
         XCTAssertFalse(b.contains(pwd), b)
         XCTAssertTrue(b.contains("[REDACTED]"))
     }
 
     func testWellFormedJSONControlStillRedacts() throws {
-        // Control: parseable JSON must still redact by key AND stay valid JSON.
         let b = Redact.redactBody(#"{"password":"hunter2secret","address":"221B Baker St","amount":25,"ok":true}"#)
         let o = try JSONSerialization.jsonObject(with: b.data(using: .utf8)!) as! [String: Any]
         XCTAssertEqual(o["password"] as? String, "[REDACTED]")

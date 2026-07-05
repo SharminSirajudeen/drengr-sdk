@@ -21,10 +21,6 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     testOptions { unitTests.isReturnDefaultValues = true }
-
-    // NOTE: no `publishing { singleVariant("release") }` here — the vanniktech
-    // plugin below configures the "release" variant publication itself; declaring
-    // it in both places throws "Using singleVariant publishing DSL multiple times".
 }
 
 dependencies {
@@ -34,16 +30,6 @@ dependencies {
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 }
 
-// NOTE: no hand-rolled `jitpack` MavenPublication here. The vanniktech plugin below
-// owns the single "release" publication; adding a second one made `signAllPublications`
-// sign it too and had Gradle try to push the `com.github.*` coordinate to Central
-// (implicit-dependency failure + wrong artifact). JitPack still works: its build runs
-// `:drengr:publishToMavenLocal` and repackages whatever that produces under its own
-// `com.github.SharminSirajudeen:drengr-sdk` scheme regardless of coordinates.
-
-// Maven Central (Central Portal) via the vanniktech plugin. Coordinates below.
-// Signing + upload credentials come from env vars / gradle.properties at publish
-// time ONLY (see gradle.properties for the exact names) — never hardcoded here.
 mavenPublishing {
     publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL)
     signAllPublications()

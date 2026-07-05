@@ -8,18 +8,6 @@ import okio.ForwardingSink
 import okio.Sink
 import okio.buffer
 
-/**
- * OkHttp interceptor that captures every exchange and emits a redacted
- * [NetworkEvent]. Covers OkHttp + Retrofit (the large majority of Android apps).
- *
- * Add it as an APPLICATION interceptor (`.addInterceptor(...)`) so it sees the
- * request as the app sent it and the response after redirects/retries. The
- * response body is buffered up to [maxBodyBytes] and re-emitted, so the app's
- * own read is untouched (OkHttp bodies are one-shot; we clone via a peek).
- *
- * Fail-open: any capture error is swallowed — the interceptor always returns the
- * real response (or rethrows the real transport error) exactly as without it.
- */
 class DrengrInterceptor internal constructor(
     private val maxBodyBytes: Long,
     private val redactHeaderNames: Set<String>,
@@ -59,11 +47,9 @@ class DrengrInterceptor internal constructor(
                     ),
                 )
             }
-            throw e // the app sees exactly what it would have without capture
+            throw e
         }
 
-        // Read a COPY of the body via peekBody — the app's one-shot body is never
-        // consumed. Textual + within cap → captured; else size-only.
         var respBody: String? = null
         var respBytes = 0L
         try {
@@ -78,7 +64,7 @@ class DrengrInterceptor internal constructor(
                 }
             }
         } catch (_: Throwable) {
-            respBody = null // size-only capture on any read hiccup
+            respBody = null
         }
 
         val statusCode = response.code
@@ -106,15 +92,9 @@ class DrengrInterceptor internal constructor(
     private fun readRequestBody(request: okhttp3.Request): String? {
         val body = request.body ?: return null
         if (!isTextual(body.contentType())) return null
-        // A one-shot/duplex body can be written only once; reading it here would
-        // consume the app's own copy so its real request ships empty. Skip.
         if (body.isOneShot() || body.isDuplex()) return null
-        // Bail BEFORE materializing when the DECLARED length already exceeds the
-        // cap — a large upload must never be buffered into memory (OOM/ANR).
         val declared = try { body.contentLength() } catch (_: Throwable) { -1L }
         if (declared > maxBodyBytes) return null
-        // Unknown length (-1, chunked): write through a HARD-capped sink so a
-        // large/streaming body still can't buffer unbounded. Over cap → size-only.
         val buffer = Buffer()
         val capped = CappedSink(buffer, maxBodyBytes)
         val sink = capped.buffer()
@@ -124,8 +104,6 @@ class DrengrInterceptor internal constructor(
         return buffer.readUtf8()
     }
 
-    /** A sink that forwards at most [limit] bytes and then drops the rest, so an
-     *  unbounded body can never exhaust memory. Records whether it overflowed. */
     private class CappedSink(delegate: Sink, private val limit: Long) : ForwardingSink(delegate) {
         var overflowed = false
             private set
@@ -160,6 +138,6 @@ class DrengrInterceptor internal constructor(
     }
 
     private inline fun safeEmit(block: () -> Unit) {
-        try { block() } catch (_: Throwable) { /* capture must never break the app */ }
+        try { block() } catch (_: Throwable) {}
     }
 }

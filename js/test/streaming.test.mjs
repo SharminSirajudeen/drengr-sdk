@@ -2,11 +2,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as capture from '../dist/esm/capture.js';
 
-// Swarm finding (OOM blocker): an SSE / streaming / huge textual response body
-// was read via `resp.clone().text()` — unbounded buffering. readCapped() must
-// cap it and still EMIT a size-only event. The first fix hit a second bug:
-// `await reader.cancel()` hangs in undici, swallowing the event entirely.
-
 async function captureOne(fetchImpl, maxBodyBytes) {
   globalThis.fetch = fetchImpl;
   let ev = null;
@@ -36,7 +31,6 @@ test('infinite SSE stream is bounded and emitted (no hang)', async () => {
     pull(controller) {
       pulls++;
       controller.enqueue(new TextEncoder().encode('data: ' + 'y'.repeat(500) + '\n\n'));
-      // never close — an open SSE channel
     },
   });
   const ev = await captureOne(

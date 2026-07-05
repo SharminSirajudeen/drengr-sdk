@@ -1,20 +1,10 @@
-/**
- * Zero-code network capture for JS runtimes (Web, React Native, Electron
- * renderer/main): patches `fetch` and `XMLHttpRequest`, emits one redacted
- * NetworkEvent per completed exchange. Fail-open by design — capture errors
- * never propagate into the app, and the app's response objects are never
- * consumed (fetch bodies are read from a clone; XHR is observed post-loadend).
- *
- * The pre-patch `fetch` is preserved and exported for the sink, so delivery
- * traffic is STRUCTURALLY invisible to capture (lesson from the Flutter SDK's
- * self-capture loop — no ignoreHosts wiring, no recursion possible).
- */
+// Zero-code fetch/XHR capture. Fail-open: capture errors never reach the app,
+// and the pre-patch fetch is preserved for the sink so delivery is invisible to capture.
 
 import { projectBody, redactBody, redactHeaders, redactUrl } from './redact.js';
 
 export interface NetworkEvent {
   method: string;
-  /** Already redacted. */
   url: string;
   statusCode: number | null;
   durationMs: number;
@@ -22,9 +12,7 @@ export interface NetworkEvent {
   responseBodyBytes: number;
   requestHeaders: Record<string, string>;
   responseHeaders: Record<string, string>;
-  /** Redacted request body text (textual bodies only, capped). */
   requestBody: string | null;
-  /** Redacted response body text (textual bodies only, capped). */
   responseBody: string | null;
   errorText: string | null;
   timestampMs: number;
@@ -32,11 +20,8 @@ export interface NetworkEvent {
 
 export interface CaptureOptions {
   maxBodyBytes?: number;
-  /** Return false to skip a request entirely (sampling / allow-listing). */
   captureWhen?: (url: string) => boolean;
-  /** Hosts to skip (exact or subdomain match). */
   ignoreHosts?: Set<string>;
-  /** Extra header names (lowercase) to mask on top of the built-in set. */
   redactHeaderNames?: Set<string>;
   onEvent: (e: NetworkEvent) => void;
 }
@@ -55,8 +40,7 @@ let originalFetch: FetchFn | null = null;
 let originalXhrOpen: typeof XMLHttpRequest.prototype.open | null = null;
 let originalXhrSend: typeof XMLHttpRequest.prototype.send | null = null;
 
-/** The runtime's fetch as it was BEFORE capture installed. Sink delivery uses
- *  this so its own requests can never be captured. */
+// pre-patch fetch; the sink uses it so its own deliveries are never captured
 export function nativeFetch(): FetchFn {
   return originalFetch ?? (g.fetch as FetchFn);
 }
@@ -69,9 +53,7 @@ export function isInstalled(): boolean {
   return installed;
 }
 
-// React Native implements fetch ON TOP of XMLHttpRequest. Detecting it lets us
-// avoid patching both layers (which would double-capture every fetch and let the
-// sink's own XHR-backed deliveries recurse).
+// RN implements fetch on top of XHR; detecting it lets us avoid patching both layers
 function isReactNative(): boolean {
   try {
     const nav = (g as Record<string, unknown>).navigator as { product?: string } | undefined;
@@ -115,7 +97,7 @@ function headerObj(h: Headers | undefined | null): Record<string, string> {
     h?.forEach((v, k) => {
       out[k] = v;
     });
-  } catch { /* fail-open */ }
+  } catch {}
   return out;
 }
 
@@ -123,9 +105,7 @@ function cap(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) : s;
 }
 
-// Read a response body with a HARD byte cap: pull chunks until `max` is exceeded,
-// then cancel — so an infinite SSE/streaming or multi-MB body never buffers
-// unbounded. Over the cap → { text: null } (size-only). Never throws.
+// hard byte cap: stop + cancel once max is exceeded so infinite/huge bodies don't buffer unbounded
 async function readCapped(resp: Response, max: number): Promise<{ text: string | null; bytes: number }> {
   const body = resp.body;
   if (!body) {
@@ -151,12 +131,10 @@ async function readCapped(resp: Response, max: number): Promise<{ text: string |
   } catch {
     return { text: null, bytes: total };
   } finally {
-    // Fire-and-forget cancel: it aborts the underlying network read (so an
-    // infinite SSE stops), but AWAITING it can hang forever (observed in
-    // undici on a cloned body) — which would swallow the event entirely.
-    try { void reader.cancel(); } catch { /* ignore */ }
+    // fire-and-forget: awaiting cancel() can hang forever on a cloned body in undici
+    try { void reader.cancel(); } catch {}
   }
-  if (over) return { text: null, bytes: total }; // over cap → size-only
+  if (over) return { text: null, bytes: total };
   const buf = new Uint8Array(total);
   let off = 0;
   for (const c of chunks) { buf.set(c, off); off += c.byteLength; }
@@ -170,10 +148,8 @@ async function readCapped(resp: Response, max: number): Promise<{ text: string |
 function emit(e: NetworkEvent): void {
   try {
     opts.onEvent(e);
-  } catch { /* the app must never see capture errors */ }
+  } catch {}
 }
-
-// ---------------------------------------------------------------- fetch ----
 
 function patchFetch(): void {
   const orig = g.fetch as FetchFn | undefined;
@@ -201,8 +177,7 @@ function patchFetch(): void {
       const b = init?.body;
       if (typeof b === 'string') reqBodyText = b;
       else if (b instanceof URLSearchParams) reqBodyText = b.toString();
-      // Streams / FormData / binary: recorded by absence (size unknown), never read.
-    } catch { /* fail-open */ }
+    } catch {}
 
     const skip = ignored(url);
     try {
@@ -228,13 +203,13 @@ function patchFetch(): void {
           timestampMs: start,
         });
       }
-      throw err; // the app sees exactly what it would have seen
+      throw err;
     }
   };
 
   try {
     g.fetch = wrapped;
-  } catch { /* frozen global: capture unavailable, app unharmed */ }
+  } catch {}
 }
 
 async function captureFetchResponse(
@@ -253,13 +228,10 @@ async function captureFetchResponse(
     const lenHeader = Number(resp.headers.get('content-length'));
     if (Number.isFinite(lenHeader) && lenHeader > 0) respBytes = lenHeader;
     if (isTextual(ct)) {
-      // Read a CLONE with a hard cap so an SSE / streaming / huge textual body
-      // can never buffer unbounded (was `resp.clone().text()` → OOM on an
-      // infinite stream). Over the cap → size-only. The app's own stream is
-      // untouched (we read the clone) and we cancel the clone's reader.
+      // read a CLONE with a hard cap; the app's own stream is untouched
       const capped = await readCapped(resp.clone(), opts.maxBodyBytes);
       if (capped.bytes > 0) respBytes = capped.bytes;
-      respBody = capped.text; // null when over cap or unreadable
+      respBody = capped.text;
     }
     emit({
       method,
@@ -275,10 +247,8 @@ async function captureFetchResponse(
       errorText: null,
       timestampMs: start,
     });
-  } catch { /* fail-open */ }
+  } catch {}
 }
-
-// ------------------------------------------------------------------ XHR ----
 
 interface XhrMeta {
   method: string;
@@ -305,7 +275,7 @@ function patchXhr(): void {
         reqBody: null,
         reqHeaders: {},
       });
-    } catch { /* fail-open */ }
+    } catch {}
     // @ts-expect-error — pass through the runtime's own signature verbatim
     return originalXhrOpen!.call(this, method, url, ...rest);
   };
@@ -314,7 +284,7 @@ function patchXhr(): void {
     try {
       const m = xhrMeta.get(this);
       if (m) m.reqHeaders[name] = value;
-    } catch { /* fail-open */ }
+    } catch {}
     return origSetHeader.call(this, name, value);
   };
 
@@ -359,27 +329,18 @@ function patchXhr(): void {
             errorText: status === 0 ? 'network_error' : null,
             timestampMs: m.start,
           });
-        } catch { /* fail-open */ }
+        } catch {}
       });
     }
     return originalXhrSend!.call(this, body as never);
   };
 }
 
-// -------------------------------------------------------------- install ----
-
 export function install(options: CaptureOptions): void {
   if (installed) return;
-  // maxBodyBytes AFTER the spread with a nullish default: the documented minimal
-  // call passes `maxBodyBytes: undefined`, and a spread of an explicit-undefined
-  // key would clobber the default — silently dropping every response body and
-  // uncapping request bodies. Coerce so undefined can never win.
+  // coerce so an explicit maxBodyBytes:undefined can't clobber the default
   opts = { ...options, maxBodyBytes: options.maxBodyBytes ?? 64 * 1024 };
-  // On React Native, fetch is XHR-backed: patching both layers would capture every
-  // fetch() TWICE and let the sink's own deliveries recurse. Patch ONLY XHR there —
-  // the single substrate every request funnels through. Native fetch elsewhere is
-  // independent, so patch both. (Self-capture is also blocked by ignoring the
-  // ingest host — see index.ts — which is what makes the RN sink path safe.)
+  // on RN fetch is XHR-backed; patch only XHR to avoid double-capture + sink recursion
   if (!isReactNative()) patchFetch();
   patchXhr();
   installed = true;
@@ -392,9 +353,8 @@ export function uninstall(): void {
     const X = g.XMLHttpRequest as typeof XMLHttpRequest | undefined;
     if (X && originalXhrOpen) X.prototype.open = originalXhrOpen;
     if (X && originalXhrSend) X.prototype.send = originalXhrSend;
-  } catch { /* best-effort */ }
+  } catch {}
   installed = false;
 }
 
-/** Exported for the projection step in the sink. */
 export { projectBody };

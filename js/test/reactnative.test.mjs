@@ -3,9 +3,6 @@ import assert from 'node:assert/strict';
 import * as capture from '../dist/esm/capture.js';
 import { Drengr } from '../dist/esm/index.js';
 
-// Swarm finding: on React Native, fetch is XHR-backed. Patching both layers
-// double-captured every request and let the sink's deliveries recurse.
-
 test('React Native: fetch is NOT patched (XHR-only)', () => {
   const before = globalThis.navigator;
   const prevXHR = globalThis.XMLHttpRequest;
@@ -32,8 +29,6 @@ test('React Native: fetch is NOT patched (XHR-only)', () => {
   }
 });
 
-// Self-capture guard (all runtimes): the ingest host is auto-excluded so the sink's
-// own deliveries are never captured — the load-bearing fix for the RN XHR sink path.
 test('ingest host is auto-ignored (no self-capture)', async () => {
   let capturedIngest = 0;
   let capturedOther = 0;

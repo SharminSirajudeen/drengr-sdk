@@ -1,19 +1,9 @@
-/// Secret and PII redaction for captured events. Common secrets in headers,
-/// URLs, and bodies (tokens, keys, cookies, card numbers, …) are masked before
-/// anything is stored or emitted.
-///
-/// Bodies are redacted structurally where possible (JSON is parsed and
-/// sensitive keys masked; form-urlencoded is split on `&`) and then scrubbed at
-/// the value level (card numbers, JWTs, bearer tokens, cookie lines) so secrets
-/// are caught regardless of field name. All functions are best-effort and never
-/// throw — on any failure the input is returned unchanged.
 library;
 
 import 'dart:convert';
 
 const redactMask = '[REDACTED]';
 
-/// Header names (lowercase) whose values are always masked.
 const sensitiveHeaders = <String>{
   'authorization',
   'proxy-authorization',
@@ -30,9 +20,7 @@ const sensitiveHeaders = <String>{
   'x-xsrf-token',
 };
 
-/// Sensitive names matched as a WHOLE normalized name only. Short tokens live
-/// here (not as substrings) so `shipping`/`spinner`/`opinion` aren't hit by
-/// `pin`, etc.
+// whole-name matches only; short tokens live here so substrings aren't hit
 const _sensitiveExact = <String>{
   'password',
   'passwd',
@@ -52,13 +40,8 @@ const _sensitiveExact = <String>{
   'otp',
   'totp',
   'iban',
-  // De-masked (3-tier policy): 'auth' (often a method/flag — real tokens are
-  // caught by the bearer/JWT value scrubbers), 'pan' (Luhn value scrubber catches
-  // real card numbers; the name collides with panel/panorama), 'sig' (a MAC, not
-  // a replayable credential). 'authorization' stays masked.
 };
 
-/// Longer fragments safe to match as substrings of a normalized name.
 const _sensitiveFragments = <String>[
   'token',
   'secret',
@@ -80,13 +63,8 @@ const _sensitiveFragments = <String>[
   'accountnumber',
   'routingnumber',
   'sortcode',
-  // --- Personal data (PII), redacted by default. Mirrors the manual blocklist
-  // real apps maintain for autocapture tools like Contentsquare (which don't
-  // auto-redact) — Drengr ships it so 0-code means 0-code PII safety. A tenant
-  // allowlists a field in the govern controls only when they deliberately want
-  // it. Specific compounds only — bare 'name'/'message' would gut analytics.
   'email',
-  'phone', // phone, phonenumber, recipientphonenumber, telephone
+  'phone',
   'firstname',
   'lastname',
   'fullname',
@@ -96,18 +74,15 @@ const _sensitiveFragments = <String>[
   'sendername',
   'passport',
   'nationality',
-  'address', // address, addressline, recipientaddress, ipaddress, emailaddress
+  'address',
   'birthdate',
   'dateofbirth',
   'promocode',
   'promotioncode',
   'messagetext',
   'giftmessage',
-  // De-masked: 'sessionid' (the funnel/correlation key — an identifier, not a
-  // credential; 'sessiontoken' stays masked) and 'signature' (a MAC, not a secret).
 ];
 
-/// Whether a header/query/field name denotes a secret.
 bool isSensitiveName(String name) {
   final n = name.toLowerCase().replaceAll(RegExp(r'[_\-$@.\s]'), '');
   if (_sensitiveExact.contains(n)) return true;
@@ -117,7 +92,6 @@ bool isSensitiveName(String name) {
   return false;
 }
 
-/// Mask the values of sensitive headers; preserve every key.
 Map<String, String> redactHeaders(
     Map<String, String> headers, Set<String> extra) {
   final out = <String, String>{};
@@ -129,9 +103,6 @@ Map<String, String> redactHeaders(
   return out;
 }
 
-// --- value-level scrubbers (run over any text or URL) ---
-
-// 13+ digits with optional single space/dash separators between digits.
 final _digitRun = RegExp(r'[0-9](?:[ -]?[0-9]){11,}');
 final _jwt =
     RegExp(r'eyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]*');
@@ -156,12 +127,10 @@ bool _luhn(String digits) {
   return sum % 10 == 0;
 }
 
-/// Redact card numbers (Luhn-validated, separator-tolerant, embedded-aware),
-/// JWTs, bearer tokens, and cookie lines anywhere in a string.
 String scrubValues(String s) {
   var out = s.replaceAllMapped(_digitRun, (m) {
     final digits = m[0]!.replaceAll(RegExp(r'[ -]'), '');
-    if (digits.length > 40) return '[REDACTED-PAN]'; // suspicious + bounds work
+    if (digits.length > 40) return '[REDACTED-PAN]';
     for (var len = 13; len <= 19 && len <= digits.length; len++) {
       for (var i = 0; i + len <= digits.length; i++) {
         if (_luhn(digits.substring(i, i + len))) return '[REDACTED-PAN]';
@@ -175,7 +144,6 @@ String scrubValues(String s) {
   return out;
 }
 
-/// Mask sensitive query/fragment params and scrub secrets in the path.
 String redactUrl(String url) {
   try {
     var result = url;
@@ -206,7 +174,6 @@ String redactUrl(String url) {
   }
 }
 
-/// Redact a body string: structurally (JSON keys / form fields) then by value.
 String redactBody(String body) {
   try {
     final decoded = _tryJson(body);
@@ -262,23 +229,14 @@ String _redactFormEncoded(String body) {
   }).join('&');
 }
 
-// --- safe projection (the annotatable DTO shipped to the server) ---
-
 const _projMaxKeys = 512;
 const _projMaxDepth = 12;
 const _projMaxStrLen = 1024;
 
-/// Project an already-redacted body into a compact, safe map of
-/// `dotted.path → scalar` for server-side annotation. Keeps only
-/// analytics-bearing leaves (numbers, bools, short non-redacted strings) and
-/// drops free-text, redaction masks, and structure. Returns a JSON object
-/// string, or null when there is nothing structured/safe to project. The
-/// device never decides what a field *means* — it only ships safe shapes; the
-/// server maps shape → business event. Best-effort; never throws.
 String? projectBody(String? body) {
   if (body == null || body.isEmpty) return null;
   final decoded = _tryJson(body) ?? _tryForm(body);
-  if (decoded == null) return null; // only structured (JSON / form) bodies
+  if (decoded == null) return null;
   final out = <String, Object?>{};
   try {
     _flatten('', decoded, out, 0);
@@ -289,8 +247,6 @@ String? projectBody(String? body) {
   }
 }
 
-/// Parse an (already-redacted) form-urlencoded body into a flat map so it can be
-/// projected like JSON. Returns null when the body isn't form-encoded.
 Map<String, dynamic>? _tryForm(String body) {
   if (!_looksFormEncoded(body)) return null;
   final map = <String, dynamic>{};
@@ -324,10 +280,9 @@ void _flatten(String prefix, dynamic v, Map<String, Object?> out, int depth) {
     }
   } else if (v is String) {
     if (v.isEmpty || v.length > _projMaxStrLen) return;
-    if (v.startsWith('[REDACTED')) return; // redactor dropped it — no signal
+    if (v.startsWith('[REDACTED')) return;
     out[prefix] = v;
   } else if (v is num || v is bool) {
     out[prefix] = v;
   }
-  // null / other types: skip
 }

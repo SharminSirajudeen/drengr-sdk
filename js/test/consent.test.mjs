@@ -2,9 +2,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Drengr } from '../dist/esm/index.js';
 
-// Swarm finding (GDPR): setEnabled(false) was runtime-only, so an opted-out user
-// was re-captured on the next launch. optOut() must PERSIST and start() must honor
-// the persisted flag on a fresh session.
 test('optOut persists across restart; optIn resumes', async () => {
   const mem = new Map();
   const storage = {
@@ -16,7 +13,6 @@ test('optOut persists across restart; optIn resumes', async () => {
   globalThis.fetch = async () =>
     new Response('{}', { headers: { 'content-type': 'application/json' } });
 
-  // Session 1: start, then opt out.
   Drengr.start({
     ingestUrl: 'https://x/ingest', publishableKey: 'drengr_pk_x',
     appPackage: 'com.x', storage, onEvent: () => { captured++; },
@@ -26,7 +22,6 @@ test('optOut persists across restart; optIn resumes', async () => {
   Drengr.stop();
   assert.equal(mem.get('drengr_opt_out'), '1', 'opt-out flag persisted to storage');
 
-  // Session 2: fresh start with the SAME storage — must stay paused.
   captured = 0;
   Drengr.start({
     ingestUrl: 'https://x/ingest', publishableKey: 'drengr_pk_x',
@@ -36,7 +31,6 @@ test('optOut persists across restart; optIn resumes', async () => {
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(captured, 0, 'opted-out install must not capture after restart');
 
-  // optIn clears the flag and resumes.
   Drengr.optIn();
   await globalThis.fetch('https://api.example.com/b');
   await new Promise((r) => setTimeout(r, 50));

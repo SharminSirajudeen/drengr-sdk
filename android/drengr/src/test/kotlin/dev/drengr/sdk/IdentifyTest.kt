@@ -13,8 +13,6 @@ import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.TimeUnit
 
-/** Exercises identify()/setExperiment() against a real IngestSink flush over a
- *  MockWebServer (same client — OkHttp — the sink actually uses in production). */
 class IdentifyTest {
     private val server = MockWebServer()
 
@@ -25,7 +23,7 @@ class IdentifyTest {
             server.url("/ingest").toString(),
             "drengr_pk_test",
             mapOf("app_package" to "test", "install_id" to "test"),
-            maxBatch = 1, // flush on the first enqueued event
+            maxBatch = 1,
         )
     }
 
@@ -82,7 +80,7 @@ class IdentifyTest {
         server.enqueue(MockResponse().setResponseCode(200))
         val sink = newSink()
         sink.identify("user_456")
-        awaitEnvelope() // the identify event's own flush
+        awaitEnvelope()
         sink.addNetwork(sampleEvent())
         val envelope = awaitEnvelope()
         assertEquals("user_456", envelope.getString("external_id"))
@@ -107,7 +105,7 @@ class IdentifyTest {
     fun setExperimentBadInputIsNoOp() {
         server.enqueue(MockResponse().setResponseCode(200))
         val sink = newSink()
-        sink.setExperiment("", "x") // must not throw
+        sink.setExperiment("", "x")
         sink.addNetwork(sampleEvent())
         val envelope = awaitEnvelope()
         assertFalse(envelope.has("experiments"))

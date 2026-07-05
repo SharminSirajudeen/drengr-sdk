@@ -21,10 +21,8 @@ void main() {
           contains('[REDACTED-PAN]'));
       expect(redactBody('{"card":"4111-1111-1111-1111"}'),
           contains('[REDACTED-PAN]'));
-      // Embedded in a longer digit run (the \b-boundary gap).
       expect(redactBody('{"x":"99941111111111111199"}'),
           contains('[REDACTED-PAN]'));
-      // A non-card number is NOT over-redacted.
       expect(redactBody('{"orderId":11831440}'), contains('11831440'));
     });
 
@@ -102,7 +100,7 @@ void main() {
       final resp = await req.close();
       final received = await utf8.decoder.bind(resp).join();
 
-      expect(received, '{"echo":{"amount":4200}}'); // app gets exact bytes
+      expect(received, '{"echo":{"amount":4200}}');
       await Future<void>.delayed(const Duration(milliseconds: 20));
       final e = events.last;
       expect(e.method, 'POST');
@@ -129,8 +127,6 @@ void main() {
 
     test('a response-stream error still emits an event with errorText',
         () async {
-      // Declares gzip but sends invalid bytes -> the body errors on read,
-      // after headers (and close()) succeed.
       server.listen((req) async {
         req.response.headers.set('content-encoding', 'gzip');
         req.response.add([0, 1, 2, 3, 4]);
@@ -138,11 +134,11 @@ void main() {
       });
       final events = <NetworkEvent>[];
       Drengr.start(onEvent: events.add);
-      final client = HttpClient(); // autoUncompress defaults to true
+      final client = HttpClient();
       final resp = await (await client.getUrl(Uri.parse(url('/err')))).close();
       try {
         await resp.drain<void>();
-      } catch (_) {/* app sees the error */}
+      } catch (_) {}
       await Future<void>.delayed(const Duration(milliseconds: 20));
       expect(events, isNotEmpty);
       expect(events.last.errorText, isNotNull);
