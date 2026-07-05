@@ -16,7 +16,7 @@ val client = OkHttpClient.Builder()
     .build()
 ```
 
-Covers OkHttp + Retrofit (the majority of Android networking). Not covered: raw
-sockets, Cronet, `HttpURLConnection` (wrapper planned). Redaction is on by default;
+Covers OkHttp + Retrofit (the majority of Android networking). Raw sockets, Cronet,
+and `HttpURLConnection` aren't intercepted — OkHttp is the integration point. Redaction is on by default;
 delivery uses a separate client with no interceptor, so it can never capture itself.
 Consent gate: `Drengr.start(..., startEnabled = false)` then `Drengr.setEnabled(true)`.
