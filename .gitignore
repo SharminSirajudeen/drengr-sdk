@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Node / Web
+node_modules/
+
+# Android
+android/.gradle/
+android/build/
+android/**/build/
+android/local.properties
+android/captures/
+*.iml
+.idea/
+
+# iOS / Swift
+.build/
+Pods/
+DerivedData/
+*.xcuserstate
+
+# Flutter / Dart
+flutter/.dart_tool/
+flutter/build/
+flutter/.packages
+flutter/.flutter-plugins
+flutter/.flutter-plugins-dependencies

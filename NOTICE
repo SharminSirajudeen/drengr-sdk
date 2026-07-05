@@ -1,0 +1,9 @@
+Drengr SDKs
+Copyright 2026 Drengr
+
+This repository contains the open-source Drengr Analytics SDKs (flutter/, js/, ios/,
+android/), all licensed under the Apache License 2.0 (see LICENSE). Each SDK directory
+also carries its own LICENSE/NOTICE.
+
+The Drengr hosted analytics service and the Drengr CLI are separate products and are
+not covered by this license.

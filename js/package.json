@@ -1,0 +1,48 @@
+{
+  "name": "drengr-js",
+  "version": "0.1.0",
+  "description": "Zero-code network analytics for JavaScript runtimes (Web, React Native, Electron) \u2014 one call captures every fetch/XHR exchange with secret/PII redaction in-process, no track() calls.",
+  "license": "Apache-2.0",
+  "homepage": "https://drengr.dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SharminSirajudeen/drengr-sdk.git"
+  },
+  "type": "module",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/esm/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.esm.json && tsc -p tsconfig.cjs.json && node -e \"require('fs').writeFileSync('dist/cjs/package.json', JSON.stringify({type:'commonjs'}))\"",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "analytics",
+    "network",
+    "observability",
+    "fetch",
+    "xhr",
+    "react-native",
+    "electron",
+    "redaction"
+  ],
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^24.0.0"
+  }
+}
