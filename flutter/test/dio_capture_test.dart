@@ -4,6 +4,9 @@ import 'package:dio/dio.dart';
 import 'package:drengr_flutter_sdk/drengr_flutter_sdk.dart';
 import 'package:test/test.dart';
 
+/// Reproduces capture against Dio's DEFAULT adapter (what real apps use) — the
+/// device showed `resp 0B`, so this pins down whether Dio's response read path
+/// is tee-d. Runs in its own file => fresh `HttpOverrides.global`.
 void main() {
   test('Dio default adapter: response body is captured (not 0 bytes)',
       () async {
@@ -22,6 +25,7 @@ void main() {
     final dio = Dio();
     final resp = await dio.get('http://127.0.0.1:${server.port}/session');
     expect(resp.statusCode, 200);
+    // App still receives the exact body — capture must never corrupt it.
     expect(resp.data.toString(), contains('secret123'));
 
     await Future<void>.delayed(const Duration(milliseconds: 40));

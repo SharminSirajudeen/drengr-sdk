@@ -14,6 +14,20 @@ import java.util.concurrent.TimeUnit
 import kotlin.math.min
 import kotlin.random.Random
 
+/**
+ * Batches captured signals and ships them to the Drengr ingest endpoint,
+ * authenticated by a publishable key. Port of the proven Dart/JS IngestSink,
+ * carrying every device-run lesson from birth:
+ *  - delivery uses a DEDICATED OkHttpClient with NO Drengr interceptor, so the
+ *    sink can never capture its own POSTs (the self-capture loop can't exist);
+ *  - the persist scheduler serializes writes on a single-thread executor, so no
+ *    starvation loop is possible;
+ *  - envelope carries sent_at_ms for server-side clock-skew correction.
+ *
+ * Best-effort and non-blocking: never throws into the app, drops oldest on
+ * overflow, retries with exponential backoff + full jitter, persists the queue
+ * to a JSONL file in the app's files dir so an app kill doesn't lose events.
+ */
 internal class IngestSink(
     filesDir: File,
     private val url: String,
@@ -22,7 +36,15 @@ internal class IngestSink(
     private val maxBatch: Int = 50,
     private val maxQueue: Int = 500,
     private val flushIntervalMs: Long = 10_000,
+    sessionId0: String = "",
 ) {
+    // Current session id, stamped on the envelope; rotated via rotateSession().
+    @Volatile
+    private var sessionId = sessionId0
+
+    // A single-thread executor is the whole concurrency model: enqueue, flush,
+    // persist, and restore all run here, so the in-memory queue needs no locks
+    // and no write can overlap another (no starvation loop).
     private val exec: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "drengr-sink").apply { isDaemon = true }
     }
@@ -31,9 +53,12 @@ internal class IngestSink(
     private var flushScheduled = false
     private var retries = 0
 
+    // Session-scoped identity/experiment state, merged into every envelope (see flush()).
+    // Mutated only on `exec` (identify/setExperiment dispatch there), same as the queue.
     private var externalId: String? = null
     private val experiments = LinkedHashMap<String, String>()
 
+    // Delivery client: NO interceptor → structurally invisible to capture.
     private val delivery = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .callTimeout(30, TimeUnit.SECONDS)
@@ -48,10 +73,17 @@ internal class IngestSink(
         exec.execute { enqueue(ev) }
     }
 
+    fun addTap(e: TapEvent) {
+        val ev = try { toTap(e) } catch (_: Throwable) { return }
+        exec.execute { enqueue(ev) }
+    }
+
+    /** Sets external_id (all events hereafter) and emits one identify event; traits
+     *  go through the same redact+project pipeline as bodies. Fail-open. */
     fun identify(externalId: String, traits: Map<String, Any?> = emptyMap()) {
         if (externalId.isEmpty()) return
         val redactedTraits = try {
-            Redact.projectBody(Redact.redactBody(JSONObject(traits).toString()))
+            Classify.classifyBody(Redact.redactBody(JSONObject(traits).toString())).projection
         } catch (_: Throwable) { null }
         val ev = try {
             JSONObject().apply {
@@ -68,10 +100,29 @@ internal class IngestSink(
         }
     }
 
+    /** Sets/clears a session-scoped experiment variant (all events hereafter, as
+     *  `experiments`). A null/empty variant clears the key. Fail-open. */
     fun setExperiment(key: String, variant: String?) {
         if (key.isEmpty()) return
         exec.execute {
             if (variant.isNullOrEmpty()) experiments.remove(key) else experiments[key] = variant
+        }
+    }
+
+    /** Flush the pending queue under the OLD session, then switch to [newId]. */
+    fun rotateSession(newId: String) {
+        if (newId.isEmpty()) return
+        exec.execute {
+            flush()
+            sessionId = newId
+        }
+    }
+
+    /** Force-send the queue now; [onComplete] runs after the attempt (sink thread). */
+    fun flushNow(onComplete: Runnable? = null) {
+        exec.execute {
+            try { flush() } catch (_: Throwable) {}
+            try { onComplete?.run() } catch (_: Throwable) {}
         }
     }
 
@@ -92,9 +143,38 @@ internal class IngestSink(
         o.put("duration_ms", e.durationMs)
         o.put("req_bytes", e.requestBodyBytes)
         o.put("resp_bytes", e.responseBodyBytes)
-        Redact.projectBody(e.requestBody)?.let { o.put("req_body", it) }
-        Redact.projectBody(e.responseBody)?.let { o.put("body", it) }
+        o.put("req_headers", headersJson(e.requestHeaders))
+        o.put("resp_headers", headersJson(e.responseHeaders))
+        // Seal-by-default classifier: free-text PII (names, addresses) that value-
+        // scrubbing can't pattern-match is sealed to a typed placeholder, not shipped.
+        // piiMap is intentionally dropped here (ships only after the encrypt layer).
+        Classify.classifyBody(e.requestBody).projection?.let { o.put("req_body", it) }
+        Classify.classifyBody(e.responseBody).projection?.let { o.put("body", it) }
         return o
+    }
+
+    private fun toTap(e: TapEvent): JSONObject {
+        val o = JSONObject()
+        o.put("kind", "tap")
+        o.put("event_id", randomId())
+        o.put("ts_ms", e.timestampMs)
+        o.put("label", e.label)
+        e.role?.let { o.put("role", it) }
+        o.put("source", e.source)
+        o.put("x", e.x.toDouble())
+        o.put("y", e.y.toDouble())
+        e.screen?.let { o.put("screen", it) }
+        return o
+    }
+
+    // Already-redacted headers → JSON object; ≤48 entries, {} when serialized >8 KiB.
+    private fun headersJson(headers: Map<String, String>): JSONObject {
+        val o = JSONObject()
+        for ((k, v) in headers) {
+            if (o.length() >= MAX_HEADER_ENTRIES) break
+            o.put(k, v)
+        }
+        return if (o.toString().toByteArray(Charsets.UTF_8).size > MAX_HEADERS_JSON_BYTES) JSONObject() else o
     }
 
     private fun enqueue(ev: JSONObject) {
@@ -118,6 +198,7 @@ internal class IngestSink(
 
         val envelope = JSONObject()
         for ((k, v) in context0) envelope.put(k, v ?: JSONObject.NULL)
+        if (sessionId.isNotEmpty()) envelope.put("session_id", sessionId)
         envelope.put("sent_at_ms", System.currentTimeMillis())
         envelope.put("events", JSONArray(batch))
         externalId?.let { envelope.put("external_id", it) }
@@ -133,6 +214,8 @@ internal class IngestSink(
                 .build()
             delivery.newCall(req).execute().use { resp ->
                 acked = resp.isSuccessful
+                // Non-retriable 4xx (revoked key 401, bad batch 400/413) never
+                // succeeds — retrying forever head-of-line-blocks the queue. Drop.
                 permanent = resp.code in 400..499 && resp.code != 429 && resp.code != 408
             }
         } catch (_: Throwable) {
@@ -140,10 +223,11 @@ internal class IngestSink(
         }
 
         if (acked || permanent) {
-            retries = 0
+            retries = 0 // batch consumed (delivered or dropped as permanent)
             schedulePersist()
             if (queue.isNotEmpty()) scheduleFlush()
         } else {
+            // Requeue at the front; shed newest on overflow.
             for (i in batch.indices.reversed()) queue.addFirst(batch[i])
             while (queue.size > maxQueue) queue.pollLast()
             schedulePersist()
@@ -159,7 +243,9 @@ internal class IngestSink(
         exec.schedule({ flush() }, delay, TimeUnit.MILLISECONDS)
     }
 
+    // --- persistence (serialized on exec; writer loops nothing — one write per tick) ---
     private fun schedulePersist() {
+        if (flushScheduled) { /* a flush is queued; persist will ride along */ }
         exec.execute { persist() }
     }
 
@@ -174,7 +260,7 @@ internal class IngestSink(
                 }
                 tmp.renameTo(file)
             }
-        } catch (_: Throwable) {}
+        } catch (_: Throwable) { /* best-effort */ }
     }
 
     private fun restore() {
@@ -186,7 +272,7 @@ internal class IngestSink(
                 }
             }
             if (queue.isNotEmpty()) scheduleFlush()
-        } catch (_: Throwable) {}
+        } catch (_: Throwable) { /* corrupt/missing → start empty */ }
     }
 
     private fun randomId(): String {
@@ -198,6 +284,8 @@ internal class IngestSink(
     companion object {
         private const val BASE_BACKOFF_MS = 2_000L
         private const val MAX_BACKOFF_MS = 5 * 60_000L
+        private const val MAX_HEADER_ENTRIES = 48
+        private const val MAX_HEADERS_JSON_BYTES = 8192
         private val JSON = "application/json; charset=utf-8".toMediaTypeOrNull()
     }
 }

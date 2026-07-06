@@ -1,19 +1,28 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'capture.dart';
 import 'network_event.dart';
 import 'redact.dart';
 
+/// Wraps a real [HttpClient], routing every request-creating call through the
+/// inner client and wrapping the result so request/response bodies can be tee'd
+/// WITHOUT altering the bytes the app sends or receives.
 class CapturingHttpClient implements HttpClient {
   CapturingHttpClient(this._inner);
   final HttpClient _inner;
+
+  static final Random _sampler = Random();
 
   Future<HttpClientRequest> _wrap(Future<HttpClientRequest> fut) async {
     final inner = await fut;
     final cap = DrengrCapture.instance;
     if (cap == null || !cap.enabled || cap.ignored(inner.uri)) return inner;
+    if (cap.sampleRate < 1.0 && _sampler.nextDouble() >= cap.sampleRate) {
+      return inner;
+    }
     final when = cap.captureWhen;
     if (when != null) {
       try {
@@ -25,7 +34,7 @@ class CapturingHttpClient implements HttpClient {
     try {
       return _CapturingRequest(inner, cap);
     } catch (_) {
-      return inner;
+      return inner; // never break the app's networking
     }
   }
 
@@ -69,6 +78,7 @@ class CapturingHttpClient implements HttpClient {
   Future<HttpClientRequest> head(String host, int port, String path) =>
       _wrap(_inner.head(host, port, path));
 
+  // ---- pure delegation ----
   @override
   bool get autoUncompress => _inner.autoUncompress;
   @override
@@ -128,12 +138,15 @@ class CapturingHttpClient implements HttpClient {
   void close({bool force = false}) => _inner.close(force: force);
 }
 
+/// Flatten multi-valued headers to a single string per name.
 Map<String, String> _flattenHeaders(HttpHeaders headers) {
   final out = <String, String>{};
   headers.forEach((k, v) => out[k] = v.join(', '));
   return out;
 }
 
+/// Wraps an [HttpClientRequest]: tees a bounded copy of the request body and,
+/// on close, wraps the response to capture status/headers/body/timing.
 class _CapturingRequest implements HttpClientRequest {
   _CapturingRequest(this._inner, this._cap)
       : _reqBuf = CappedBuffer(_cap.maxBodyBytes),
@@ -190,6 +203,8 @@ class _CapturingRequest implements HttpClientRequest {
     _inner.writeCharCode(charCode);
   }
 
+  // close() drives the inner send; close() and done resolve to the SAME wrapped
+  // response so neither path bypasses capture.
   @override
   Future<HttpClientResponse> close() {
     _innerClose ??= _inner.close();
@@ -204,15 +219,16 @@ class _CapturingRequest implements HttpClientRequest {
     try {
       return _buildResponse(resp);
     } catch (_) {
-      return resp;
+      return resp; // capture must never break the response path
     }
   }
 
   HttpClientResponse _buildResponse(HttpClientResponse resp) {
     final reqHeaders = _flattenHeaders(_inner.headers);
     final respHeaders = _flattenHeaders(resp.headers);
-    final reqTextual = isTextual(_inner.headers.contentType);
-    final respTextual = isTextual(resp.headers.contentType);
+    final bodiesOk = _cap.bodiesAllowed(uri);
+    final reqTextual = bodiesOk && isTextual(_inner.headers.contentType);
+    final respTextual = bodiesOk && isTextual(resp.headers.contentType);
     final respBuf = CappedBuffer(_cap.maxBodyBytes);
 
     return _CapturingResponse(
@@ -245,6 +261,7 @@ class _CapturingRequest implements HttpClientRequest {
     );
   }
 
+  // ---- delegation ----
   @override
   HttpHeaders get headers => _inner.headers;
   @override
@@ -289,6 +306,10 @@ class _CapturingRequest implements HttpClientRequest {
       _inner.abort(exception, stackTrace);
 }
 
+/// Wraps an [HttpClientResponse] stream. Tee-ing and completion both live in the
+/// stream PIPELINE (`map` + a transformer), not in the subscription's handlers,
+/// so a consumer that rebinds `onData`/`onDone` (Dio's `CastStream`, `drain()`,
+/// `asFuture()`) cannot drop the capture. Errors complete the event too.
 class _CapturingResponse extends Stream<List<int>>
     implements HttpClientResponse {
   _CapturingResponse(this._inner,
@@ -329,6 +350,7 @@ class _CapturingResponse extends Stream<List<int>>
         onError: onError, onDone: onDone, cancelOnError: cancelOnError);
   }
 
+  // ---- delegation ----
   @override
   int get statusCode => _inner.statusCode;
   @override

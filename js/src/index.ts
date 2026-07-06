@@ -1,5 +1,16 @@
-// Drengr Analytics for JS runtimes (Web, React Native, Electron): one start() call
-// captures every fetch/XHR exchange, redacts in-process, and ships under a publishable key.
+/**
+ * Drengr Analytics for JavaScript runtimes — Web, React Native, Electron.
+ * One call captures every fetch/XHR exchange (secret/PII redaction applied
+ * in-process before anything leaves the runtime) and ships it to your org's
+ * ingest endpoint under a publishable key.
+ *
+ *   import { Drengr } from 'drengr-js';
+ *   Drengr.start({
+ *     ingestUrl: 'https://<ref>.supabase.co/functions/v1/ingest',
+ *     publishableKey: 'drengr_pk_…',
+ *     appPackage: 'com.example.app',
+ *   });
+ */
 
 import {
   install,
@@ -10,22 +21,29 @@ import {
   type NetworkEvent,
 } from './capture.js';
 import { IngestSink, defaultStorage, type StorageAdapter } from './sink.js';
+import { SessionManager, SESSION_IDLE_MS, SESSION_MAX_MS } from './session.js';
+import { SDK_VERSION } from './version.js';
 
 export type { NetworkEvent, StorageAdapter };
-export { IngestSink };
+export { IngestSink, SessionManager, SESSION_IDLE_MS, SESSION_MAX_MS, SDK_VERSION };
 export * as redact from './redact.js';
 
 export interface DrengrOptions {
   ingestUrl: string;
   publishableKey: string;
+  /** Stable app identifier shown in the dashboard (reverse-DNS or domain). */
   appPackage: string;
+  /** Extra envelope context merged over the defaults. */
   context?: Record<string, unknown>;
+  /** Storage for the offline queue + install id. Default: localStorage or memory. */
   storage?: StorageAdapter;
   maxBodyBytes?: number;
   captureWhen?: CaptureOptions['captureWhen'];
   ignoreHosts?: string[];
   redactHeaders?: string[];
+  /** Start paused (e.g. behind a consent gate); call setEnabled(true) later. */
   enabled?: boolean;
+  /** Called after each capture, before delivery — for debugging. */
   onEvent?: (e: NetworkEvent) => void;
 }
 
@@ -34,6 +52,7 @@ const OPTOUT_KEY = 'drengr_opt_out';
 
 let sink: IngestSink | null = null;
 let storageRef: StorageAdapter | null = null;
+let lifecycleTeardown: (() => void) | null = null;
 
 function runtimeOs(): string {
   try {
@@ -47,7 +66,7 @@ function runtimeOs(): string {
     if (proc?.versions?.electron) return 'electron';
     if (nav?.userAgent) return 'web';
     if (proc?.versions?.node) return 'node';
-  } catch {}
+  } catch { /* fall through */ }
   return 'js';
 }
 
@@ -59,21 +78,24 @@ function genId(): string {
   try {
     const c = (globalThis as Record<string, unknown>).crypto as Crypto | undefined;
     if (c?.randomUUID) return c.randomUUID();
-  } catch {}
+  } catch { /* fall through */ }
   return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`;
 }
 
 export const Drengr = {
+  /** Install capture + delivery. Subsequent calls are ignored (stop() first). */
   start(options: DrengrOptions): void {
     if (isInstalled()) return;
     const storage = options.storage ?? defaultStorage();
-    storageRef = storage;
-    // install_id may resolve async (RN AsyncStorage); the sink reads it lazily, backfilled here
+    storageRef = storage; // so optOut()/optIn() can persist the choice after start()
+    // A mutable context: on async storage (React Native's AsyncStorage) the
+    // install_id resolves after start() returns, so the sink reads it lazily and
+    // we backfill here before the first flush.
     const context: Record<string, unknown> = {
       app_package: options.appPackage,
       os: runtimeOs(),
-      install_id: '',
-      session_id: `s-${Date.now()}`,
+      install_id: '', // filled sync (localStorage) or async (AsyncStorage) below
+      session_id: '', // owned by the SessionManager below
       sdk_version: SDK_VERSION,
       ...options.context,
     };
@@ -85,18 +107,33 @@ export const Drengr = {
     });
     sink = s;
 
-    // consent-safe: read sync opt-out now so an opted-out user is paused before capture;
-    // async storage can't read synchronously, so start paused and enable after it resolves
+    // Session rotation: idle/max-age rules; the old queue is flushed under the
+    // old id before the new id lands in the shared context.
+    const session = new SessionManager(
+      storage,
+      () => void s.flush(),
+      (id) => { context.session_id = id; },
+    );
+    context.session_id = session.currentId();
+    void session.restore();
+
+    // CONSENT-SAFE START. Sync storage (localStorage): read the opt-out NOW and
+    // fold it into startPaused so an opted-out user is paused BEFORE capture goes
+    // live — reading it a microtask later let same-tick requests leak. Async
+    // storage (RN AsyncStorage): can't read synchronously, so start PAUSED and
+    // enable only after the async read resolves (never if opted out).
     const asyncStore = isThenable(storage.getItem(INSTALL_KEY));
     const syncOptOut = !asyncStore && storage.getItem(OPTOUT_KEY) === '1';
     const startPaused = options.enabled === false || asyncStore || syncOptOut;
 
-    // always exclude our own ingest host (on RN the sink's fetch routes through patched XHR)
+    // Always exclude our OWN ingest host: on React Native fetch is XHR-backed, so
+    // the pre-patch fetch the sink uses still routes through the patched XHR and
+    // would self-capture every delivery. Ignoring the host closes that loop.
     const ignoreHosts = new Set((options.ignoreHosts ?? []).map((h) => h.toLowerCase()));
     try {
       const ih = new URL(options.ingestUrl).host;
       if (ih) ignoreHosts.add(ih.toLowerCase());
-    } catch {}
+    } catch { /* malformed ingest URL: nothing to add */ }
 
     install({
       maxBodyBytes: options.maxBodyBytes,
@@ -106,62 +143,113 @@ export const Drengr = {
         ? new Set(options.redactHeaders.map((h) => h.toLowerCase()))
         : undefined,
       onEvent: (e) => {
+        session.touch(); // rotation flushes the old queue BEFORE this event enqueues
         try {
           options.onEvent?.(e);
-        } catch {}
+        } catch { /* app callback must not break delivery */ }
         s.addNetwork(e);
       },
     });
     if (startPaused) setEnabled(false);
 
+    // Web lifecycle: flush on hide/pagehide (keepalive delivery), rotate on stale resume.
+    const doc = (globalThis as Record<string, unknown>).document as
+      | { addEventListener?: (t: string, f: () => void) => void;
+          removeEventListener?: (t: string, f: () => void) => void;
+          visibilityState?: string }
+      | undefined;
+    if (doc && typeof doc.addEventListener === 'function') {
+      const onVis = () => {
+        try {
+          if (doc.visibilityState === 'hidden') {
+            session.background();
+            void s.flush();
+          } else {
+            session.foreground();
+          }
+        } catch { /* fail-open */ }
+      };
+      const onHide = () => {
+        try {
+          session.background();
+          void s.flush();
+        } catch { /* fail-open */ }
+      };
+      const win = globalThis as unknown as {
+        addEventListener?: (t: string, f: () => void) => void;
+        removeEventListener?: (t: string, f: () => void) => void;
+      };
+      doc.addEventListener('visibilitychange', onVis);
+      if (typeof win.addEventListener === 'function') win.addEventListener('pagehide', onHide);
+      lifecycleTeardown = () => {
+        try {
+          doc.removeEventListener?.('visibilitychange', onVis);
+          win.removeEventListener?.('pagehide', onHide);
+        } catch { /* best-effort */ }
+      };
+    }
+
+    // Resolve install_id + opt-out across BOTH sync and async storage.
     void Promise.resolve(storage.getItem(INSTALL_KEY)).then((existing) => {
       let id = typeof existing === 'string' && existing ? existing : '';
       if (!id) {
         id = genId();
-        try { void storage.setItem(INSTALL_KEY, id); } catch {}
+        try { void storage.setItem(INSTALL_KEY, id); } catch { /* memory-only ok */ }
       }
       context.install_id = id;
     });
     void Promise.resolve(storage.getItem(OPTOUT_KEY)).then((v) => {
       if (v === '1') {
-        setEnabled(false);
+        setEnabled(false); // opted out — stay paused regardless
       } else if (options.enabled !== false && !syncOptOut) {
-        setEnabled(true);
+        setEnabled(true); // not opted out and not explicitly disabled — resume
       }
     });
   },
 
+  /** Pause/resume capture (consent gate). Delivery of already-captured events continues. */
   setEnabled(v: boolean): void {
     setEnabled(v);
   },
 
-  // persistent opt-out (GDPR): survives restart; start() reads the flag and stays paused
+  /** Persistently opt this install OUT of capture (GDPR). Unlike setEnabled(false),
+   *  this survives restart: it writes the opt-out flag to storage AND pauses now, so
+   *  start() reads it and stays paused on the next launch. */
   optOut(): void {
     setEnabled(false);
-    try { void storageRef?.setItem(OPTOUT_KEY, '1'); } catch {}
+    try { void storageRef?.setItem(OPTOUT_KEY, '1'); } catch { /* memory-only ok */ }
   },
 
+  /** Reverse optOut(): clear the persisted flag and resume capture. */
   optIn(): void {
-    try { void storageRef?.removeItem(OPTOUT_KEY); } catch {}
+    try { void storageRef?.removeItem(OPTOUT_KEY); } catch { /* memory-only ok */ }
     setEnabled(true);
   },
 
+  /** Flush the queue now (e.g. before navigation). Best-effort. */
   flush(): Promise<void> {
     return sink?.flush() ?? Promise.resolve();
   },
 
+  /** Sets external_id (your own stable, non-PII user id — not an email) on the
+   *  session and all events hereafter; emits one identify event. traits are
+   *  redacted before delivery. Fail-open: no-op if start() hasn't run or
+   *  externalId is empty. */
   identify(externalId: string, traits?: Record<string, unknown>): void {
-    try { sink?.identify(externalId, traits); } catch {}
+    try { sink?.identify(externalId, traits); } catch { /* fail-open */ }
   },
 
+  /** Tags the session with an experiment variant, attached to all events
+   *  hereafter as `experiments`. Pass a null/empty variant to clear the key. */
   setExperiment(key: string, variant: string | null): void {
-    try { sink?.setExperiment(key, variant); } catch {}
+    try { sink?.setExperiment(key, variant); } catch { /* fail-open */ }
   },
 
+  /** Uninstall capture, restoring the runtime's own fetch/XHR. */
   stop(): void {
     uninstall();
+    try { lifecycleTeardown?.(); } catch { /* best-effort */ }
+    lifecycleTeardown = null;
     sink = null;
   },
 };
-
-export const SDK_VERSION = '0.1.0';

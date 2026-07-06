@@ -23,7 +23,7 @@ test('identify() sets external_id on the envelope and emits one identify event; 
   });
 
   Drengr.identify('user_123', { email: 'a@b.com', plan: 'pro' });
-  await globalThis.fetch('https://api.other.com/thing');
+  await globalThis.fetch('https://api.other.com/thing'); // captured AFTER identify()
   await new Promise((r) => setTimeout(r, 20));
   await Drengr.flush();
   await new Promise((r) => setTimeout(r, 20));
@@ -86,9 +86,11 @@ test('setExperiment() attaches experiments to the envelope; null clears; bad inp
   let envelope = ingestEnvelopes(calls).at(-1);
   assert.deepEqual(envelope.experiments, { checkout_flow: 'variant_b' });
 
+  // Bad input: no-op, never throws.
   assert.doesNotThrow(() => Drengr.setExperiment('', 'x'));
   assert.doesNotThrow(() => Drengr.setExperiment(123, 'x'));
 
+  // Clearing with null removes the key.
   Drengr.setExperiment('checkout_flow', null);
   await globalThis.fetch('https://api.other.com/b');
   await new Promise((r) => setTimeout(r, 20));

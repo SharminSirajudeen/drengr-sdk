@@ -1,0 +1,30 @@
+name: drengr_flutter_native
+description: Native-layer network capture for Flutter — wraps the native Drengr Android/iOS SDKs so traffic from native SDKs (payments, ads, maps) invisible to any Dart hook is still captured. Optional add-on to drengr_flutter_sdk.
+version: 0.1.0
+homepage: https://drengr.dev
+repository: https://github.com/SharminSirajudeen/drengr-sdk
+publish_to: none
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+  flutter: ">=3.10.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  drengr_flutter_sdk:
+    path: ../flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  lints: ^4.0.0
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: dev.drengr.flutter_native
+        pluginClass: DrengrFlutterNativePlugin
+      ios:
+        pluginClass: DrengrFlutterNativePlugin

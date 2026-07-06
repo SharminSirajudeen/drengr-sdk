@@ -1,18 +1,31 @@
-// Zero-code fetch/XHR capture. Fail-open: capture errors never reach the app,
-// and the pre-patch fetch is preserved for the sink so delivery is invisible to capture.
+/**
+ * Zero-code network capture for JS runtimes (Web, React Native, Electron
+ * renderer/main): patches `fetch` and `XMLHttpRequest`, emits one redacted
+ * NetworkEvent per completed exchange. Fail-open by design — capture errors
+ * never propagate into the app, and the app's response objects are never
+ * consumed (fetch bodies are read from a clone; XHR is observed post-loadend).
+ *
+ * The pre-patch `fetch` is preserved and exported for the sink, so delivery
+ * traffic is STRUCTURALLY invisible to capture (lesson from the Flutter SDK's
+ * self-capture loop — no ignoreHosts wiring, no recursion possible).
+ */
 
 import { projectBody, redactBody, redactHeaders, redactUrl } from './redact.js';
 
 export interface NetworkEvent {
   method: string;
+  /** Already redacted. */
   url: string;
   statusCode: number | null;
   durationMs: number;
-  requestBodyBytes: number;
-  responseBodyBytes: number;
+  /** Accurate byte size, or undefined when unknowable (streams) — never a fake 0. */
+  requestBodyBytes: number | undefined;
+  responseBodyBytes: number | undefined;
   requestHeaders: Record<string, string>;
   responseHeaders: Record<string, string>;
+  /** Redacted request body text (textual bodies only, capped). */
   requestBody: string | null;
+  /** Redacted response body text (textual bodies only, capped). */
   responseBody: string | null;
   errorText: string | null;
   timestampMs: number;
@@ -20,8 +33,11 @@ export interface NetworkEvent {
 
 export interface CaptureOptions {
   maxBodyBytes?: number;
+  /** Return false to skip a request entirely (sampling / allow-listing). */
   captureWhen?: (url: string) => boolean;
+  /** Hosts to skip (exact or subdomain match). */
   ignoreHosts?: Set<string>;
+  /** Extra header names (lowercase) to mask on top of the built-in set. */
   redactHeaderNames?: Set<string>;
   onEvent: (e: NetworkEvent) => void;
 }
@@ -40,7 +56,8 @@ let originalFetch: FetchFn | null = null;
 let originalXhrOpen: typeof XMLHttpRequest.prototype.open | null = null;
 let originalXhrSend: typeof XMLHttpRequest.prototype.send | null = null;
 
-// pre-patch fetch; the sink uses it so its own deliveries are never captured
+/** The runtime's fetch as it was BEFORE capture installed. Sink delivery uses
+ *  this so its own requests can never be captured. */
 export function nativeFetch(): FetchFn {
   return originalFetch ?? (g.fetch as FetchFn);
 }
@@ -53,7 +70,9 @@ export function isInstalled(): boolean {
   return installed;
 }
 
-// RN implements fetch on top of XHR; detecting it lets us avoid patching both layers
+// React Native implements fetch ON TOP of XMLHttpRequest. Detecting it lets us
+// avoid patching both layers (which would double-capture every fetch and let the
+// sink's own XHR-backed deliveries recurse).
 function isReactNative(): boolean {
   try {
     const nav = (g as Record<string, unknown>).navigator as { product?: string } | undefined;
@@ -97,7 +116,7 @@ function headerObj(h: Headers | undefined | null): Record<string, string> {
     h?.forEach((v, k) => {
       out[k] = v;
     });
-  } catch {}
+  } catch { /* fail-open */ }
   return out;
 }
 
@@ -105,7 +124,35 @@ function cap(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) : s;
 }
 
-// hard byte cap: stop + cancel once max is exceeded so infinite/huge bodies don't buffer unbounded
+// Size + capturable text for a request body: accurate-or-undefined, never a fake 0.
+function requestBodyInfo(b: unknown): { text: string | null; bytes: number | undefined } {
+  try {
+    if (b == null) return { text: null, bytes: 0 };
+    if (typeof b === 'string') return { text: b, bytes: b.length };
+    if (typeof URLSearchParams !== 'undefined' && b instanceof URLSearchParams) {
+      const t = b.toString(); // form-encoded text — rides the normal redaction path
+      return { text: t, bytes: t.length };
+    }
+    if (typeof FormData !== 'undefined' && b instanceof FormData) {
+      let total = 0;
+      b.forEach((v) => {
+        if (typeof v === 'string') total += v.length;
+        else if (v && typeof (v as Blob).size === 'number') total += (v as Blob).size;
+      });
+      return { text: null, bytes: total };
+    }
+    if (typeof Blob !== 'undefined' && b instanceof Blob) return { text: null, bytes: b.size };
+    if (typeof ArrayBuffer !== 'undefined' && b instanceof ArrayBuffer) return { text: null, bytes: b.byteLength };
+    if (ArrayBuffer.isView(b)) return { text: null, bytes: b.byteLength };
+    return { text: null, bytes: undefined }; // ReadableStream / Document / unknown: never consume, never 0
+  } catch {
+    return { text: null, bytes: undefined };
+  }
+}
+
+// Read a response body with a HARD byte cap: pull chunks until `max` is exceeded,
+// then cancel — so an infinite SSE/streaming or multi-MB body never buffers
+// unbounded. Over the cap → { text: null } (size-only). Never throws.
 async function readCapped(resp: Response, max: number): Promise<{ text: string | null; bytes: number }> {
   const body = resp.body;
   if (!body) {
@@ -131,10 +178,12 @@ async function readCapped(resp: Response, max: number): Promise<{ text: string |
   } catch {
     return { text: null, bytes: total };
   } finally {
-    // fire-and-forget: awaiting cancel() can hang forever on a cloned body in undici
-    try { void reader.cancel(); } catch {}
+    // Fire-and-forget cancel: it aborts the underlying network read (so an
+    // infinite SSE stops), but AWAITING it can hang forever (observed in
+    // undici on a cloned body) — which would swallow the event entirely.
+    try { void reader.cancel(); } catch { /* ignore */ }
   }
-  if (over) return { text: null, bytes: total };
+  if (over) return { text: null, bytes: total }; // over cap → size-only
   const buf = new Uint8Array(total);
   let off = 0;
   for (const c of chunks) { buf.set(c, off); off += c.byteLength; }
@@ -148,8 +197,10 @@ async function readCapped(resp: Response, max: number): Promise<{ text: string |
 function emit(e: NetworkEvent): void {
   try {
     opts.onEvent(e);
-  } catch {}
+  } catch { /* the app must never see capture errors */ }
 }
+
+// ---------------------------------------------------------------- fetch ----
 
 function patchFetch(): void {
   const orig = g.fetch as FetchFn | undefined;
@@ -161,6 +212,7 @@ function patchFetch(): void {
     let url = '';
     let method = 'GET';
     let reqBodyText: string | null = null;
+    let reqBytes: number | undefined = 0;
     let reqHeaders: Record<string, string> = {};
     try {
       if (typeof input === 'string') url = input;
@@ -169,21 +221,24 @@ function patchFetch(): void {
         url = input.url;
         method = input.method || 'GET';
         reqHeaders = headerObj(input.headers);
+        if (input.body != null) reqBytes = undefined; // Request stream body: size unknown
       }
       if (init?.method) method = init.method;
       if (init?.headers) {
         reqHeaders = { ...reqHeaders, ...headerObj(new Headers(init.headers)) };
       }
-      const b = init?.body;
-      if (typeof b === 'string') reqBodyText = b;
-      else if (b instanceof URLSearchParams) reqBodyText = b.toString();
-    } catch {}
+      if (init?.body != null) {
+        const r = requestBodyInfo(init.body);
+        reqBodyText = r.text;
+        reqBytes = r.bytes;
+      }
+    } catch { /* fail-open */ }
 
     const skip = ignored(url);
     try {
       const resp = await originalFetch!(input as RequestInfo, init);
       if (!skip) {
-        void captureFetchResponse(resp, url, method.toUpperCase(), reqHeaders, reqBodyText, start);
+        void captureFetchResponse(resp, url, method.toUpperCase(), reqHeaders, reqBodyText, reqBytes, start);
       }
       return resp;
     } catch (err) {
@@ -193,7 +248,7 @@ function patchFetch(): void {
           url: redactUrl(url),
           statusCode: null,
           durationMs: Date.now() - start,
-          requestBodyBytes: reqBodyText?.length ?? 0,
+          requestBodyBytes: reqBytes,
           responseBodyBytes: 0,
           requestHeaders: redactHeaders(reqHeaders, opts.redactHeaderNames),
           responseHeaders: {},
@@ -203,13 +258,13 @@ function patchFetch(): void {
           timestampMs: start,
         });
       }
-      throw err;
+      throw err; // the app sees exactly what it would have seen
     }
   };
 
   try {
     g.fetch = wrapped;
-  } catch {}
+  } catch { /* frozen global: capture unavailable, app unharmed */ }
 }
 
 async function captureFetchResponse(
@@ -218,27 +273,33 @@ async function captureFetchResponse(
   method: string,
   reqHeaders: Record<string, string>,
   reqBodyText: string | null,
+  reqBytes: number | undefined,
   start: number,
 ): Promise<void> {
   try {
     const respHeaders = headerObj(resp.headers);
     const ct = resp.headers.get('content-type');
     let respBody: string | null = null;
-    let respBytes = 0;
-    const lenHeader = Number(resp.headers.get('content-length'));
-    if (Number.isFinite(lenHeader) && lenHeader > 0) respBytes = lenHeader;
+    let respBytes: number | undefined; // unknown until proven — never a fake 0
+    const clHeader = resp.headers.get('content-length');
+    const lenHeader = Number(clHeader);
+    if (clHeader != null && Number.isFinite(lenHeader) && lenHeader >= 0) respBytes = lenHeader;
     if (isTextual(ct)) {
-      // read a CLONE with a hard cap; the app's own stream is untouched
+      // Read a CLONE with a hard cap so an SSE / streaming / huge textual body
+      // can never buffer unbounded (was `resp.clone().text()` → OOM on an
+      // infinite stream). Over the cap → size-only. The app's own stream is
+      // untouched (we read the clone) and we cancel the clone's reader.
       const capped = await readCapped(resp.clone(), opts.maxBodyBytes);
       if (capped.bytes > 0) respBytes = capped.bytes;
-      respBody = capped.text;
+      else respBytes = respBytes ?? 0; // fully read: 0 is accurate
+      respBody = capped.text; // null when over cap or unreadable
     }
     emit({
       method,
       url: redactUrl(url),
       statusCode: resp.status,
       durationMs: Date.now() - start,
-      requestBodyBytes: reqBodyText?.length ?? 0,
+      requestBodyBytes: reqBytes,
       responseBodyBytes: respBytes,
       requestHeaders: redactHeaders(reqHeaders, opts.redactHeaderNames),
       responseHeaders: redactHeaders(respHeaders, opts.redactHeaderNames),
@@ -247,14 +308,17 @@ async function captureFetchResponse(
       errorText: null,
       timestampMs: start,
     });
-  } catch {}
+  } catch { /* fail-open */ }
 }
+
+// ------------------------------------------------------------------ XHR ----
 
 interface XhrMeta {
   method: string;
   url: string;
   start: number;
   reqBody: string | null;
+  reqBytes: number | undefined;
   reqHeaders: Record<string, string>;
 }
 const xhrMeta = new WeakMap<XMLHttpRequest, XhrMeta>();
@@ -273,9 +337,10 @@ function patchXhr(): void {
         url: String(url),
         start: 0,
         reqBody: null,
+        reqBytes: 0,
         reqHeaders: {},
       });
-    } catch {}
+    } catch { /* fail-open */ }
     // @ts-expect-error — pass through the runtime's own signature verbatim
     return originalXhrOpen!.call(this, method, url, ...rest);
   };
@@ -284,7 +349,7 @@ function patchXhr(): void {
     try {
       const m = xhrMeta.get(this);
       if (m) m.reqHeaders[name] = value;
-    } catch {}
+    } catch { /* fail-open */ }
     return origSetHeader.call(this, name, value);
   };
 
@@ -292,14 +357,16 @@ function patchXhr(): void {
     const m = xhrMeta.get(this);
     if (m && !ignored(m.url)) {
       m.start = Date.now();
-      if (typeof body === 'string') m.reqBody = body;
-      else if (body instanceof URLSearchParams) m.reqBody = body.toString();
+      const r = requestBodyInfo(body);
+      m.reqBody = r.text;
+      m.reqBytes = r.bytes;
       this.addEventListener('loadend', () => {
         try {
           const status = this.status;
           let respBody: string | null = null;
-          let respBytes = 0;
-          if (this.responseType === '' || this.responseType === 'text') {
+          let respBytes: number | undefined; // unknown until proven — never a fake 0
+          const rt = this.responseType;
+          if (rt === '' || rt === 'text') {
             const text = this.responseText ?? '';
             respBytes = text.length;
             if (
@@ -309,6 +376,21 @@ function patchXhr(): void {
             ) {
               respBody = text;
             }
+          } else if (rt === 'json') {
+            const rv = this.response;
+            if (rv != null) {
+              const t = JSON.stringify(rv);
+              if (typeof t === 'string') {
+                respBytes = t.length;
+                if (t.length <= opts.maxBodyBytes) respBody = t; // redacted at emit below
+              }
+            }
+          } else if (rt === 'blob') {
+            const rv = this.response as Blob | null;
+            if (rv && typeof rv.size === 'number') respBytes = rv.size;
+          } else if (rt === 'arraybuffer') {
+            const rv = this.response as ArrayBuffer | null;
+            if (rv && typeof rv.byteLength === 'number') respBytes = rv.byteLength;
           }
           const respHeaders: Record<string, string> = {};
           for (const line of (this.getAllResponseHeaders() || '').split('\r\n')) {
@@ -320,7 +402,7 @@ function patchXhr(): void {
             url: redactUrl(m.url),
             statusCode: status === 0 ? null : status,
             durationMs: Date.now() - m.start,
-            requestBodyBytes: m.reqBody?.length ?? 0,
+            requestBodyBytes: m.reqBytes,
             responseBodyBytes: respBytes,
             requestHeaders: redactHeaders(m.reqHeaders, opts.redactHeaderNames),
             responseHeaders: redactHeaders(respHeaders, opts.redactHeaderNames),
@@ -329,18 +411,27 @@ function patchXhr(): void {
             errorText: status === 0 ? 'network_error' : null,
             timestampMs: m.start,
           });
-        } catch {}
+        } catch { /* fail-open */ }
       });
     }
     return originalXhrSend!.call(this, body as never);
   };
 }
 
+// -------------------------------------------------------------- install ----
+
 export function install(options: CaptureOptions): void {
   if (installed) return;
-  // coerce so an explicit maxBodyBytes:undefined can't clobber the default
+  // maxBodyBytes AFTER the spread with a nullish default: the documented minimal
+  // call passes `maxBodyBytes: undefined`, and a spread of an explicit-undefined
+  // key would clobber the default — silently dropping every response body and
+  // uncapping request bodies. Coerce so undefined can never win.
   opts = { ...options, maxBodyBytes: options.maxBodyBytes ?? 64 * 1024 };
-  // on RN fetch is XHR-backed; patch only XHR to avoid double-capture + sink recursion
+  // On React Native, fetch is XHR-backed: patching both layers would capture every
+  // fetch() TWICE and let the sink's own deliveries recurse. Patch ONLY XHR there —
+  // the single substrate every request funnels through. Native fetch elsewhere is
+  // independent, so patch both. (Self-capture is also blocked by ignoring the
+  // ingest host — see index.ts — which is what makes the RN sink path safe.)
   if (!isReactNative()) patchFetch();
   patchXhr();
   installed = true;
@@ -353,8 +444,9 @@ export function uninstall(): void {
     const X = g.XMLHttpRequest as typeof XMLHttpRequest | undefined;
     if (X && originalXhrOpen) X.prototype.open = originalXhrOpen;
     if (X && originalXhrSend) X.prototype.send = originalXhrSend;
-  } catch {}
+  } catch { /* best-effort */ }
   installed = false;
 }
 
+/** Exported for the projection step in the sink. */
 export { projectBody };

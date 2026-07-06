@@ -25,16 +25,22 @@ android {
 
 dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // compileOnly: the SDK must never hard-require Cronet (class-load guarded adapter).
+    compileOnly("org.chromium.net:cronet-api:119.6045.31")
+    // compileOnly: compose-ui is never hard-required either (class-load guarded tap hook).
+    compileOnly("androidx.compose.ui:ui:1.7.5")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    testImplementation("org.chromium.net:cronet-api:119.6045.31")
+    testImplementation("androidx.compose.ui:ui:1.7.5")
 }
 
 mavenPublishing {
     publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL)
     signAllPublications()
 
-    coordinates("dev.drengr", "analytics-android", "0.1.0")
+    coordinates("dev.drengr", "analytics-android", "0.2.0")
 
     pom {
         name.set("Drengr Analytics (Android)")

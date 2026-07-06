@@ -1,6 +1,8 @@
 import XCTest
 @testable import Drengr
 
+/// Exercises identify()/setExperiment() against a real IngestSink flush, routed
+/// through a recording URLProtocol so the actual envelope JSON can be inspected.
 final class IdentifyTests: XCTestCase {
 
     private func makeSink(maxBatch: Int = 1) -> IngestSink {
@@ -58,7 +60,7 @@ final class IdentifyTests: XCTestCase {
     func testExternalIdAttachesToASubsequentEvent() {
         let sink = makeSink()
         sink.identify("user_456")
-        _ = awaitEnvelope()
+        _ = awaitEnvelope() // the identify event's own flush
         sink.addNetwork(sampleEvent())
         guard let envelope = awaitEnvelope() else { return XCTFail("no request received") }
         XCTAssertEqual(envelope["external_id"] as? String, "user_456")
@@ -80,13 +82,14 @@ final class IdentifyTests: XCTestCase {
 
     func testSetExperimentBadInputIsNoOp() {
         let sink = makeSink()
-        sink.setExperiment("", variant: "x")
+        sink.setExperiment("", variant: "x") // must not throw
         sink.addNetwork(sampleEvent())
         guard let envelope = awaitEnvelope() else { return XCTFail("no request received") }
         XCTAssertNil(envelope["experiments"])
     }
 }
 
+/// Captures each request's body and answers with 200 OK — no real network needed.
 final class RecordingURLProtocol: URLProtocol {
     private static let lock = NSLock()
     private static var bodies: [Data] = []
@@ -105,6 +108,7 @@ final class RecordingURLProtocol: URLProtocol {
         toFulfill.forEach { $0.fulfill() }
     }
 
+    /// Blocks (via XCTest's runloop-pumping wait) until a body arrives, or nil on timeout.
     static func waitForNextBody(timeout: TimeInterval) -> Data? {
         lock.lock()
         if let first = bodies.first {

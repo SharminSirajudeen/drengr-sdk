@@ -1,0 +1,5 @@
+# Controls what `dart pub publish` uploads (overrides .gitignore for pub).
+.dart_tool/
+build/
+pubspec.lock
+*.log

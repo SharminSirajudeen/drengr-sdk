@@ -20,10 +20,14 @@ the Drengr CLI are separate products and are not part of this repo.
 
 | Platform | Registry | Coordinate |
 |---|---|---|
-| **Flutter** | [pub.dev](https://pub.dev/packages/drengr_flutter_sdk) | `drengr_flutter_sdk: ^0.2.1` |
-| **Web** | [npm](https://www.npmjs.com/package/drengr-js) | `drengr-js@0.1.0` |
-| **iOS** | Swift Package Manager / CocoaPods | `from: "0.1.0"` · `pod 'Drengr', '~> 0.1.0'` |
-| **Android** | [Maven Central](https://central.sonatype.com/artifact/dev.drengr/analytics-android) | `dev.drengr:analytics-android:0.1.0` |
+| **Flutter** | [pub.dev](https://pub.dev/packages/drengr_flutter_sdk) | `drengr_flutter_sdk: ^0.4.0` |
+| **Web** | [npm](https://www.npmjs.com/package/drengr-js) | `drengr-js@0.2.0` |
+| **iOS** | Swift Package Manager / CocoaPods | `from: "0.2.0"` · `pod 'Drengr', '~> 0.2.0'` |
+| **Android** | [Maven Central](https://central.sonatype.com/artifact/dev.drengr/analytics-android) | `dev.drengr:analytics-android:0.2.0` |
+
+These are the versions in this repo (tag `v0.2.0`). Registry publishes may lag the tag —
+pub.dev currently has `0.2.1`, npm `0.1.0`. `flutter_native/` is an optional add-on
+(native-layer capture beneath the Dart engine) at `0.1.0`, not yet published.
 
 ## Quick start
 
@@ -62,13 +66,13 @@ Drengr.start({
 ### iOS
 Add the package in Xcode (**File → Add Package Dependencies…**):
 ```
-https://github.com/SharminSirajudeen/drengr-sdk.git   → from 0.1.0
+https://github.com/SharminSirajudeen/drengr-sdk.git   → from 0.2.0
 ```
 or in `Package.swift`:
 ```swift
-.package(url: "https://github.com/SharminSirajudeen/drengr-sdk.git", from: "0.1.0")
+.package(url: "https://github.com/SharminSirajudeen/drengr-sdk.git", from: "0.2.0")
 ```
-or CocoaPods: `pod 'Drengr', '~> 0.1.0'`
+or CocoaPods: `pod 'Drengr', '~> 0.2.0'`
 ```swift
 import Drengr
 
@@ -82,7 +86,7 @@ Drengr.start(
 ### Android
 ```kotlin
 // build.gradle.kts
-implementation("dev.drengr:analytics-android:0.1.0")
+implementation("dev.drengr:analytics-android:0.2.0")
 ```
 ```kotlin
 val client = OkHttpClient.Builder()

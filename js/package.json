@@ -1,6 +1,6 @@
 {
   "name": "drengr-js",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Zero-code network analytics for JavaScript runtimes (Web, React Native, Electron) \u2014 one call captures every fetch/XHR exchange with secret/PII redaction in-process, no track() calls.",
   "license": "Apache-2.0",
   "homepage": "https://drengr.dev",
@@ -27,7 +27,7 @@
   ],
   "sideEffects": false,
   "scripts": {
-    "build": "tsc -p tsconfig.esm.json && tsc -p tsconfig.cjs.json && node -e \"require('fs').writeFileSync('dist/cjs/package.json', JSON.stringify({type:'commonjs'}))\"",
+    "build": "node scripts/gen-version.mjs && tsc -p tsconfig.esm.json && tsc -p tsconfig.cjs.json && node -e \"require('fs').writeFileSync('dist/cjs/package.json', JSON.stringify({type:'commonjs'}))\"",
     "test": "npm run build && node --test test/*.test.mjs",
     "prepack": "npm run build"
   },

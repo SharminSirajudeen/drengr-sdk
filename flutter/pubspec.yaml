@@ -1,6 +1,6 @@
 name: drengr_flutter_sdk
-description: Zero-code in-process network capture for Flutter — one line records every HTTP request/response (http, Dio, dart:io) with secret/PII redaction, no networking changes.
-version: 0.2.1
+description: Zero-code mobile analytics for Flutter — one line captures and ships every HTTP request/response (http, Dio, dart:io) to Drengr with secret/PII redaction, no networking changes.
+version: 0.4.0
 homepage: https://drengr.dev
 repository: https://github.com/SharminSirajudeen/drengr-sdk
 issue_tracker: https://github.com/SharminSirajudeen/drengr-sdk/issues
@@ -13,8 +13,16 @@ topics:
 
 environment:
   sdk: ">=3.0.0 <4.0.0"
+  flutter: ">=3.16.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  shared_preferences: ^2.3.0
 
 dev_dependencies:
+  flutter_test:
+    sdk: flutter
   lints: ^4.0.0
   test: ^1.24.0
   dio: ^5.7.0

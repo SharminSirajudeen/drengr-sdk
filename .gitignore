@@ -3,11 +3,13 @@
 
 # Node / Web
 node_modules/
+js/dist/
 
 # Android
 android/.gradle/
 android/build/
 android/**/build/
+android/.kotlin/
 android/local.properties
 android/captures/
 *.iml
@@ -15,13 +17,15 @@ android/captures/
 
 # iOS / Swift
 .build/
+.swiftpm/
 Pods/
 DerivedData/
 *.xcuserstate
 
 # Flutter / Dart
-flutter/.dart_tool/
+.dart_tool/
 flutter/build/
-flutter/.packages
-flutter/.flutter-plugins
-flutter/.flutter-plugins-dependencies
+flutter_native/build/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies

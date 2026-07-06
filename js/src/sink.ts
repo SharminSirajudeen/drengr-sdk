@@ -1,11 +1,25 @@
-// Batches captured events and ships them to the ingest endpoint under a publishable key.
-// Best-effort: never throws into the app, drops oldest on overflow, retries with
-// exponential backoff + jitter, and persists the queue through a pluggable storage adapter.
+/**
+ * Batches captured signals and ships them to the Drengr ingest endpoint,
+ * authenticated by a publishable key. Port of the proven Dart IngestSink,
+ * carrying both device-run lessons from birth:
+ *  - delivery uses the PRE-PATCH fetch (structurally invisible to capture —
+ *    the self-capture loop cannot exist);
+ *  - the persistence scheduler uses the writer-loops-until-clean pattern
+ *    (an overlap marks dirty and returns; never reschedules a microtask,
+ *    which starved the event loop and froze the Flutter demo).
+ *
+ * Best-effort and non-blocking: never throws into the app, drops oldest on
+ * overflow, retries with exponential backoff + full jitter, persists the
+ * queue through a pluggable storage adapter (localStorage on web,
+ * AsyncStorage-compatible on React Native, in-memory fallback anywhere).
+ */
 
-import { nativeFetch, projectBody, type NetworkEvent } from './capture.js';
+import { nativeFetch, type NetworkEvent } from './capture.js';
 import { redactBody } from './redact.js';
+import { classifyBody } from './classify.js';
 
-// localStorage satisfies this directly; React Native AsyncStorage via its promise API.
+/** Minimal async-tolerant KV storage. localStorage satisfies it directly;
+ *  React Native's AsyncStorage satisfies it via its promise API. */
 export interface StorageAdapter {
   getItem(key: string): string | null | Promise<string | null>;
   setItem(key: string, value: string): void | Promise<void>;
@@ -13,8 +27,11 @@ export interface StorageAdapter {
 }
 
 export interface IngestSinkOptions {
+  /** Full ingest URL, e.g. https://<ref>.supabase.co/functions/v1/ingest */
   url: string;
+  /** Publishable key (drengr_pk_…) sent as Authorization: Bearer. */
   publishableKey: string;
+  /** Shared envelope context (app_package, os, install_id, session_id, …). */
   context: Record<string, unknown>;
   storage?: StorageAdapter;
   maxBatch?: number;
@@ -25,6 +42,29 @@ export interface IngestSinkOptions {
 const QUEUE_KEY = 'drengr_queue_v1';
 const BASE_BACKOFF_MS = 2_000;
 const MAX_BACKOFF_MS = 5 * 60_000;
+const HEADERS_MAX_ENTRIES = 48;
+const HEADERS_MAX_JSON_BYTES = 8192;
+
+// Cap the already-redacted header map: 48 entries max; oversized serialization → {}.
+function capHeaders(h: Record<string, string> | null | undefined): Record<string, string> {
+  try {
+    if (!h) return {};
+    const out: Record<string, string> = {};
+    let n = 0;
+    for (const [k, v] of Object.entries(h)) {
+      if (n >= HEADERS_MAX_ENTRIES) break;
+      if (typeof v !== 'string') continue;
+      out[k] = v;
+      n++;
+    }
+    const json = JSON.stringify(out);
+    let size = json.length;
+    try { size = new TextEncoder().encode(json).length; } catch { /* char-length fallback */ }
+    return size > HEADERS_MAX_JSON_BYTES ? {} : out;
+  } catch {
+    return {};
+  }
+}
 
 export function defaultStorage(): StorageAdapter {
   try {
@@ -35,7 +75,7 @@ export function defaultStorage(): StorageAdapter {
       ls.removeItem(probe);
       return ls;
     }
-  } catch {}
+  } catch { /* private mode / RN / node — fall through */ }
   const mem = new Map<string, string>();
   return {
     getItem: (k) => mem.get(k) ?? null,
@@ -62,6 +102,7 @@ export class IngestSink {
   private persisting = false;
   private persistDirty = false;
 
+  // Session-scoped identity/experiment state, merged into every envelope (see flush()).
   private externalId: string | undefined;
   private experiments: Record<string, string> = {};
 
@@ -76,19 +117,22 @@ export class IngestSink {
     void this.restore();
   }
 
+  /** Map a captured exchange to an ingest event and enqueue it. */
   addNetwork = (e: NetworkEvent): void => {
     try {
       this.enqueue(this.toNet(e));
-    } catch {}
+    } catch { /* never throw into the app */ }
   };
 
-  // sets external_id on the session + emits one identify event; traits are redacted
+  /** Sets the session's external_id (attached to every event hereafter) and emits
+   *  one identify event. traits go through the same redact+project pipeline as
+   *  bodies. Fail-open: invalid externalId is a no-op. */
   identify = (externalId: string, traits?: Record<string, unknown>): void => {
     if (typeof externalId !== 'string' || externalId.length === 0) return;
     let redactedTraits: string | null = null;
     try {
-      if (traits) redactedTraits = projectBody(redactBody(JSON.stringify(traits)));
-    } catch {}
+      if (traits) redactedTraits = classifyBody(redactBody(JSON.stringify(traits))).projection;
+    } catch { /* bad traits: ship identify without them */ }
     try {
       this.externalId = externalId;
       this.enqueue({
@@ -98,29 +142,33 @@ export class IngestSink {
         external_id: externalId,
         ...(redactedTraits != null ? { traits: redactedTraits } : {}),
       });
-    } catch {}
+    } catch { /* never throw into the app */ }
   };
 
-  // sets/clears a session-scoped experiment variant; null/empty clears the key
+  /** Sets/clears a session-scoped experiment variant (attached to every event
+   *  hereafter as `experiments`). variant null/empty clears the key. Fail-open. */
   setExperiment = (key: string, variant: string | null | undefined): void => {
     try {
       if (typeof key !== 'string' || key.length === 0) return;
       if (!variant) delete this.experiments[key];
       else this.experiments[key] = variant;
-    } catch {}
+    } catch { /* never throw into the app */ }
   };
 
   private toNet(e: NetworkEvent): Record<string, unknown> {
     const status = e.statusCode ?? 0;
     const failed = e.errorText != null || status >= 400;
-    const reqBody = projectBody(e.requestBody);
-    const respBody = projectBody(e.responseBody);
+    // Seal-by-default classifier for the body projection: free-text PII (names,
+    // addresses) that value-scrubbing can't pattern-match is sealed to a typed
+    // placeholder instead of shipped. Real-data validation: this path leaks 0.
+    const reqBody = classifyBody(e.requestBody).projection;
+    const respBody = classifyBody(e.responseBody).projection;
     return {
       kind: failed ? 'net_fail' : 'net',
       event_id: randomId(),
       ts_ms: e.timestampMs,
       method: e.method,
-      url: e.url,
+      url: e.url, // already redacted by the capture layer
       status,
       error_kind: failed
         ? e.errorText != null
@@ -132,6 +180,8 @@ export class IngestSink {
       duration_ms: e.durationMs,
       req_bytes: e.requestBodyBytes,
       resp_bytes: e.responseBodyBytes,
+      req_headers: capHeaders(e.requestHeaders),
+      resp_headers: capHeaders(e.responseHeaders),
       ...(reqBody != null ? { req_body: reqBody } : {}),
       ...(respBody != null ? { body: respBody } : {}),
     };
@@ -140,7 +190,7 @@ export class IngestSink {
   private enqueue(ev: Record<string, unknown>): void {
     this.queue.push(ev);
     while (this.queue.length > this.maxQueue) {
-      this.queue.shift();
+      this.queue.shift(); // drop oldest on overflow — never block
     }
     this.schedulePersist();
     if (this.retries > 0) return; // backoff timer drives the flush
@@ -160,7 +210,8 @@ export class IngestSink {
     this.sending = true;
 
     const batch = this.queue.splice(0, 1000);
-    // sent_at_ms at send time so the server can correct clock skew
+    // sent_at_ms = device clock AT SEND: the server derives clock error from it
+    // and corrects timeline placement exactly. Set per attempt.
     const envelope: Record<string, unknown> = { ...this.context, sent_at_ms: Date.now(), events: batch };
     if (this.externalId) envelope.external_id = this.externalId;
     if (Object.keys(this.experiments).length > 0) envelope.experiments = { ...this.experiments };
@@ -168,6 +219,7 @@ export class IngestSink {
     let acked = false;
     let permanent = false;
     try {
+      // nativeFetch: the pre-patch fetch — delivery is invisible to capture.
       const resp = await nativeFetch()(this.url, {
         method: 'POST',
         headers: {
@@ -178,19 +230,22 @@ export class IngestSink {
         keepalive: batch.length < 30, // survive page unload for small batches
       });
       acked = resp.status >= 200 && resp.status < 300;
-      // non-retriable 4xx will never succeed; drop it so it can't head-of-line-block (429/408 still retry)
+      // A non-retriable 4xx (revoked key 401, bad batch 400/413) will never
+      // succeed — retrying it forever head-of-line-blocks the queue and drops all
+      // newer events. Drop it. 429/408 are transient and still retry.
       permanent = resp.status >= 400 && resp.status < 500 && resp.status !== 429 && resp.status !== 408;
     } catch {
-      acked = false;
+      acked = false; // best-effort: never throw into the app
     } finally {
       this.sending = false;
       if (acked || permanent) {
-        this.retries = 0;
+        this.retries = 0; // batch consumed (delivered or dropped as permanent)
         this.schedulePersist();
         if (this.queue.length > 0 && this.timer == null) {
           this.timer = setTimeout(() => void this.flush(), this.flushIntervalMs);
         }
       } else {
+        // Keep the batch: requeue at the front, shed newest on overflow.
         this.queue.unshift(...batch);
         while (this.queue.length > this.maxQueue) this.queue.pop();
         this.schedulePersist();
@@ -208,7 +263,7 @@ export class IngestSink {
     this.timer = setTimeout(() => void this.flush(), delay);
   }
 
-  // persistence: writer loops until clean; an overlap marks dirty
+  // --- persistence (writer-loops-until-clean; overlap marks dirty) ---
 
   private schedulePersist(): void {
     if (this.persistScheduled) return;
@@ -219,7 +274,7 @@ export class IngestSink {
   private async persist(): Promise<void> {
     this.persistScheduled = false;
     if (this.persisting) {
-      this.persistDirty = true;
+      this.persistDirty = true; // the in-flight writer re-snapshots
       return;
     }
     this.persisting = true;
@@ -232,7 +287,7 @@ export class IngestSink {
           await this.storage.setItem(QUEUE_KEY, JSON.stringify(this.queue));
         }
       } while (this.persistDirty);
-    } catch {} finally {
+    } catch { /* best-effort */ } finally {
       this.persisting = false;
     }
   }
@@ -251,7 +306,7 @@ export class IngestSink {
           this.timer = setTimeout(() => void this.flush(), this.flushIntervalMs);
         }
       }
-    } catch {}
+    } catch { /* corrupt/missing store: start empty */ }
   }
 }
 
@@ -259,7 +314,7 @@ function randomId(): string {
   try {
     const c = (globalThis as Record<string, unknown>).crypto as Crypto | undefined;
     if (c?.randomUUID) return c.randomUUID().replace(/-/g, '');
-  } catch {}
+  } catch { /* fall through */ }
   let out = '';
   for (let i = 0; i < 32; i++) out += Math.floor(Math.random() * 16).toString(16);
   return out;

@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'Drengr'
-  s.version          = '0.1.0'
+  s.version          = '0.2.0'
   s.summary          = '0-code mobile analytics SDK for iOS.'
   s.description      = 'Zero-code, in-process network + behavior capture for iOS: one call ' \
                         'records every URLSession exchange with secret/PII redaction applied ' \
