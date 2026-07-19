@@ -3,7 +3,12 @@ import Foundation
 /// Seal-by-default body splitter (port of classify.ts). One pass over a captured
 /// body splits every leaf into DROP (credentials/PCI -> [REDACTED-*], never stored),
 /// SEAL (PII/unknown free-text -> raw into piiMap, typed placeholder into projection),
-/// or KEEP (business signal -> plaintext). Typed placeholders keep leaf type stable.
+/// or KEEP (business signal: numbers/bools whose NAME doesn't read as PII, single-token
+/// allowlisted enums -> plaintext). Typed placeholders keep leaf type stable.
+/// GUARANTEE (honest scope): every free-text/spaced string, and every value matching a
+/// PII PATTERN, seals by default; a value whose NAME hints PII seals even as a number.
+/// The one residual is a BARE NUMBER under a name that gives no hint it is PII (a raw
+/// coordinate named "x") — genuinely ambiguous, best-effort, not "never".
 /// piiMap is collected for the (future) encrypt layer; only `projection` ships today.
 enum Classify {
     struct Classified {
@@ -15,10 +20,6 @@ enum Classify {
     private static let maxKeys = 512
     private static let maxDepth = 12
     private static let maxStr = 1024
-    private static let normalizeChars = CharacterSet(charactersIn: "_-$@. \t\n")
-    private static func norm(_ name: String) -> String {
-        name.lowercased().components(separatedBy: normalizeChars).joined()
-    }
 
     // DROP — pure secrets + PCI card data.
     private static let credentialNames: Set<String> = [
@@ -57,41 +58,39 @@ enum Classify {
     ]
 
     // --- value detectors ---
+    // The credential/PII value patterns + checksum primitives live in Patterns.swift,
+    // shared with Redact so a hardening fix can't land in one file and miss the other.
+    // credRes uses pemDetectRe (BEGIN prefix only) so a TRUNCATED private key still DROPs.
     private static let credRes: [NSRegularExpression] = [
-        try! NSRegularExpression(pattern: "eyJ[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]*"),
-        try! NSRegularExpression(pattern: "[Bb]earer\\s+[A-Za-z0-9\\-._~+/]+=*"),
-        try! NSRegularExpression(pattern: "\\b(?:(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|gh[opusr]_[A-Za-z0-9]{36,}|xox[baprs]-[A-Za-z0-9-]{10,})\\b"),
-        try! NSRegularExpression(pattern: "-----BEGIN[A-Z0-9 ]*PRIVATE KEY-----"),
+        Patterns.jwtRe, Patterns.bearerRe, Patterns.secretTokenRe, Patterns.pemDetectRe,
     ]
-    private static let emailRe = try! NSRegularExpression(pattern: "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}")
-    private static let ssnRe = try! NSRegularExpression(pattern: "\\b\\d{3}-\\d{2}-\\d{4}\\b")
-    private static let phoneRe = try! NSRegularExpression(pattern: "(?:\\+\\d{1,3}[ .-]?)?\\(?\\d{3}\\)?[ .-]\\d{3}[ .-]\\d{4}\\b")
-    private static let ipv4Re = try! NSRegularExpression(pattern: "\\b(?:(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)\\.){3}(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)\\b")
-    private static let ipv6Re = try! NSRegularExpression(pattern: "\\b(?:[A-Fa-f0-9]{1,4}:){2,7}[A-Fa-f0-9]{0,4}\\b")
-    private static let uuidRe = try! NSRegularExpression(pattern: "\\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\b")
-    private static let digitRunRe = try! NSRegularExpression(pattern: "[0-9](?:[ -]?[0-9]){11,}")
-    private static let doubleSpaceRe = try! NSRegularExpression(pattern: "\\s{2,}")
+    // Any whitespace at all — the single-token KEEP gate. A spaced/prose value under a
+    // business-allowlisted name ("Jane Doe") is free-text PII, not an enum, so it seals.
+    // Classify-only (not a PII value detector), so it stays here.
+    private static let whitespaceRe = try! NSRegularExpression(pattern: "\\s")
+    // Long, low-false-positive PII name fragments — a field whose NAME contains one seals
+    // even a NUMERIC value (a national/tax id or geo coord sent as a number would otherwise
+    // KEEP as a measure). Only long unambiguous tokens — never 'lat'/'ip' (→ 'latency'/'flip').
+    private static let piiNameFragments: [String] = [
+        "latitude", "longitude", "nationalid", "taxid", "passport", "driverlicense", "driverslicense",
+        "socialsecurity", "accountnumber", "routingnumber", "creditcard", "cardnumber", "dateofbirth",
+    ]
+    private static func nameLooksPii(_ n: String) -> Bool {
+        piiNameFragments.contains { n.contains($0) }
+    }
 
     private static func matches(_ re: NSRegularExpression, _ s: String) -> Bool {
         re.firstMatch(in: s, range: NSRange(location: 0, length: (s as NSString).length)) != nil
     }
 
-    private static func isBool(_ n: NSNumber) -> Bool {
-        CFGetTypeID(n) == CFBooleanGetTypeID()
+    private static func firstMatchString(_ re: NSRegularExpression, _ s: String) -> String? {
+        let ns = s as NSString
+        guard let m = re.firstMatch(in: s, range: NSRange(location: 0, length: ns.length)) else { return nil }
+        return ns.substring(with: m.range)
     }
 
-    private static func luhn(_ digits: String) -> Bool {
-        if digits.count < 13 { return false }
-        var sum = 0
-        var alt = false
-        for ch in digits.reversed() {
-            guard let d = ch.wholeNumberValue, d >= 0, d <= 9 else { return false }
-            var n = d
-            if alt { n *= 2; if n > 9 { n -= 9 } }
-            sum += n
-            alt.toggle()
-        }
-        return sum % 10 == 0
+    private static func isBool(_ n: NSNumber) -> Bool {
+        CFGetTypeID(n) == CFBooleanGetTypeID()
     }
 
     private static func credentialValue(_ s: String) -> Bool {
@@ -100,28 +99,20 @@ enum Classify {
 
     private static func panValue(_ s: String) -> Bool {
         let ns = s as NSString
-        guard let m = digitRunRe.firstMatch(in: s, range: NSRange(location: 0, length: ns.length)) else { return false }
+        guard let m = Patterns.digitRunRe.firstMatch(in: s, range: NSRange(location: 0, length: ns.length)) else { return false }
         let d = ns.substring(with: m.range).replacingOccurrences(of: "[ -]", with: "", options: .regularExpression)
-        if d.count > 40 { return true }
-        let chars = Array(d)
-        var len = 13
-        while len <= 19 && len <= chars.count {
-            var i = 0
-            while i + len <= chars.count {
-                if luhn(String(chars[i..<(i + len)])) { return true }
-                i += 1
-            }
-            len += 1
-        }
-        return false
+        return Patterns.looksLikePan(d)
     }
 
     private static func piiKind(_ s: String) -> String? {
-        if matches(emailRe, s) { return "email" }
-        if matches(ssnRe, s) { return "ssn" }
-        if matches(phoneRe, s) { return "phone" }
-        if matches(ipv4Re, s) || matches(ipv6Re, s) { return "ip" }
-        if matches(uuidRe, s) { return "deviceid" }
+        if matches(Patterns.emailRe, s) { return "email" }
+        if matches(Patterns.ssnRe, s) { return "ssn" }
+        if matches(Patterns.phoneRe, s) || matches(Patterns.e164Re, s) { return "phone" }
+        if matches(Patterns.macRe, s) { return "macaddress" } // before ip: the loose ipv6 regex also matches a MAC
+        if matches(Patterns.ipv4Re, s) || matches(Patterns.ipv6Re, s) { return "ip" }
+        if matches(Patterns.uuidRe, s) { return "deviceid" }
+        if let ib = firstMatchString(Patterns.ibanRe, s), Patterns.isIbanValue(ib) { return "iban" }
+        if matches(Patterns.cryptoRe, s) { return "wallet" }
         return nil
     }
 
@@ -145,19 +136,37 @@ enum Classify {
     }
 
     private static func classifyLeaf(_ key: String, _ path: String, _ v: Any) -> Disp {
-        let n = norm(key)
-        if let s = v as? String, credentialValue(s) || panValue(s) { return .drop(sameTyped(v, "[REDACTED-SECRET]")) }
+        let n = Patterns.norm(key)
+        // 1. hard credentials (value or name) -> DROP (never sealed, never recoverable).
+        if let s = v as? String, credentialValue(s) { return .drop(sameTyped(v, "[REDACTED-SECRET]")) }
         if credentialNames.contains(n) { return .drop(sameTyped(v, "[REDACTED-SECRET]")) }
 
-        if let s = v as? String, let vk = piiKind(s) { return .seal("[PII:\(vk)]", jsonRaw(v), path) }
-        if piiNames.contains(n) { return .seal(sameTyped(v, "[PII:\(n)]"), jsonRaw(v), path) }
+        // 1b. oversized free text -> DROP before any value regex runs on it. The value
+        //     patterns are bounded, but a huge leaf is never business signal, and this
+        //     keeps the classifier's own passes cheap on a pathological body.
+        if let s = v as? String, s.count > maxStr { return .drop("[FREETEXT:len=\(s.count)]") }
 
+        // 2. a recognized PII KIND by value -> SEAL. Runs before the generic PAN drop
+        //    so a recoverable-PII value (e.g. an IBAN) isn't mis-dropped as a card by a
+        //    coincidental Luhn substring — a real card is not a piiKind, so it still drops below.
+        if let s = v as? String, let vk = piiKind(s) { return .seal("[PII:\(vk)]", jsonRaw(v), path) }
+
+        // 3. card-shaped digit run -> DROP (PCI: worthless as analytics, dangerous even sealed).
+        if let s = v as? String, panValue(s) { return .drop(sameTyped(v, "[REDACTED-SECRET]")) }
+
+        // 4. PII by NAME -> SEAL. Exact PII name, OR a long PII name-fragment so a national/
+        //    tax id or geo coordinate sent as a NUMBER seals instead of KEEPing as a measure.
+        if piiNames.contains(n) || nameLooksPii(n) { return .seal(sameTyped(v, "[PII:\(n)]"), jsonRaw(v), path) }
+
+        // 5. numbers / booleans that survived credential+PII checks are business signal -> KEEP
         if v is NSNumber { return .keep(v) }
 
+        // 6. strings: an allowlisted SINGLE-TOKEN enum -> KEEP; everything else seals. The
+        //    no-whitespace gate closes the plaintext-name leak — a spaced/prose value
+        //    ("Jane Doe", "call John back") under a business name now seals, not KEEPs.
         if let s = v as? String {
             if s.isEmpty { return .keep(s) }
-            if s.count > maxStr { return .drop("[FREETEXT:len=\(s.count)]") }
-            if businessAllowlist.contains(n), s.count <= 64, !matches(doubleSpaceRe, s) { return .keep(s) }
+            if businessAllowlist.contains(n), s.count <= 64, !matches(whitespaceRe, s) { return .keep(s) }
             return .seal("[PII]", jsonRaw(v), path)
         }
         return .drop(sameTyped(v, "[REDACTED]"))

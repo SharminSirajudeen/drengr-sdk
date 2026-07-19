@@ -34,12 +34,13 @@ enum Redact {
         "recipientname", "customername", "sendername", "passport", "nationality",
         "address", "birthdate", "dateofbirth", "promocode", "promotioncode",
         "messagetext", "giftmessage",
+        // Long, low-FP numeric-PII fragments — a national/tax id or geo coordinate sent
+        // as a JSON NUMBER survives value-scrubbing; name-masking is the only catch for it.
+        "latitude", "longitude", "nationalid", "taxid", "driverlicense", "driverslicense", "socialsecurity",
     ]
 
-    private static let normalizeChars = CharacterSet(charactersIn: "_-$@. \t\n")
-
     static func isSensitiveName(_ name: String) -> Bool {
-        let n = name.lowercased().components(separatedBy: normalizeChars).joined()
+        let n = Patterns.norm(name)
         if sensitiveExact.contains(n) { return true }
         return sensitiveFragments.contains { n.contains($0) }
     }
@@ -57,66 +58,46 @@ enum Redact {
     }
 
     // --- value-level scrubbers ---
-    private static let digitRun = try! NSRegularExpression(pattern: "[0-9](?:[ -]?[0-9]){11,}")
-    private static let jwt = try! NSRegularExpression(pattern: "eyJ[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]*")
-    private static let bearer = try! NSRegularExpression(pattern: "[Bb]earer\\s+[A-Za-z0-9\\-._~+/]+=*")
+    // Value/secret/checksum patterns live in Patterns.swift (shared with Classify so a
+    // hardening fix can't land in one file and be missed in the other). cookieLine is
+    // redact-only (a whole-line mask, never a classifier detector), so it stays here.
     private static let cookieLine = try! NSRegularExpression(pattern: "^(set-cookie|cookie)\\s*:\\s*.*$", options: [.caseInsensitive, .anchorsMatchLines])
-    // Free-text PII by VALUE PATTERN (audit blocker #1). Phone needs separators.
-    private static let email = try! NSRegularExpression(pattern: "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}")
-    private static let ssn = try! NSRegularExpression(pattern: "\\b\\d{3}-\\d{2}-\\d{4}\\b")
-    private static let phone = try! NSRegularExpression(pattern: "(?:\\+\\d{1,3}[ .-]?)?\\(?\\d{3}\\)?[ .-]\\d{3}[ .-]\\d{4}\\b")
-    // Well-known opaque SECRETS by unambiguous vendor prefix — catches a key under a
-    // benign field name (name-masking misses). Zero-FP by anchoring on the prefix.
-    private static let secretToken = try! NSRegularExpression(pattern: "\\b(?:(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|gh[opusr]_[A-Za-z0-9]{36,}|xox[baprs]-[A-Za-z0-9-]{10,})\\b")
-    private static let pem = try! NSRegularExpression(pattern: "-----BEGIN[A-Z0-9 ]*PRIVATE KEY-----[\\s\\S]*?-----END[A-Z0-9 ]*PRIVATE KEY-----")
-    // IPv4 and UUID (IDFA/GAID/device-id) — name-masking leaks these when they ride
-    // in query params, custom headers, or free-text bodies.
-    private static let ipv4 = try! NSRegularExpression(pattern: "\\b(?:(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)\\.){3}(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)\\b")
-    private static let uuid = try! NSRegularExpression(pattern: "\\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\b")
 
-    private static func luhn(_ digits: String) -> Bool {
-        if digits.count < 13 { return false }
-        var sum = 0
-        var alt = false
-        for ch in digits.reversed() {
-            guard let d = ch.wholeNumberValue, d >= 0, d <= 9 else { return false }
-            var n = d
-            if alt { n *= 2; if n > 9 { n -= 9 } }
-            sum += n
-            alt.toggle()
-        }
-        return sum % 10 == 0
+    /// ISO 7064 MOD-97-10 (the IBAN check). Re-exported from Patterns to preserve the
+    /// public Redact API the parity suite calls.
+    static func mod97(_ iban: String) -> Int { Patterns.mod97(iban) }
+
+    /// An IBAN only if it matches the format AND passes mod-97. Re-exported from Patterns.
+    static func isIbanValue(_ s: String) -> Bool { Patterns.isIbanValue(s) }
+
+    private static func isBool(_ n: NSNumber) -> Bool {
+        CFGetTypeID(n) == CFBooleanGetTypeID()
     }
 
     static func scrubValues(_ s: String) -> String {
-        var out = replaceAll(digitRun, in: s) { m in
-            let digits = m.replacingOccurrences(of: "[ -]", with: "", options: .regularExpression)
-            if digits.count > 40 { return "[REDACTED-PAN]" }
-            let chars = Array(digits)
-            var len = 13
-            while len <= 19 && len <= chars.count {
-                var i = 0
-                while i + len <= chars.count {
-                    if luhn(String(chars[i..<(i + len)])) { return "[REDACTED-PAN]" }
-                    i += 1
-                }
-                len += 1
-            }
-            return m
+        // Structured PII FIRST — before the generic PAN digit-run, so an IBAN/E.164's
+        // embedded digit run can't be swallowed and mislabeled a card. MAC before IPv6.
+        var out = replaceAll(Patterns.ibanRe, in: s) { m in isIbanValue(m) ? "[REDACTED-IBAN]" : m } // mod-97 gate
+        out = replaceAll(Patterns.cryptoRe, in: out) { _ in "[REDACTED-WALLET]" }
+        out = replaceAll(Patterns.e164Re, in: out) { _ in "[REDACTED-PHONE]" }
+        out = replaceAll(Patterns.macRe, in: out) { _ in "[REDACTED-MAC]" } // before ipv6 — a MAC's colons must not be half-eaten
+        out = replaceAll(Patterns.ipv6Re, in: out) { _ in "[REDACTED-IP]" }
+        out = replaceAll(Patterns.digitRunRe, in: out) { m in
+            Patterns.looksLikePan(m.replacingOccurrences(of: "[ -]", with: "", options: .regularExpression)) ? "[REDACTED-PAN]" : m
         }
-        out = replaceAll(jwt, in: out) { _ in "[REDACTED-JWT]" }
-        out = replaceAll(bearer, in: out) { _ in "Bearer \(mask)" }
+        out = replaceAll(Patterns.jwtRe, in: out) { _ in "[REDACTED-JWT]" }
+        out = replaceAll(Patterns.bearerRe, in: out) { _ in "Bearer \(mask)" }
         out = replaceAll(cookieLine, in: out) { m in
             let prefix = m.lowercased().hasPrefix("set-cookie") ? "set-cookie" : "cookie"
             return "\(prefix): \(mask)"
         }
-        out = replaceAll(email, in: out) { _ in "[REDACTED-EMAIL]" }
-        out = replaceAll(ssn, in: out) { _ in "[REDACTED-SSN]" }
-        out = replaceAll(phone, in: out) { _ in "[REDACTED-PHONE]" }
-        out = replaceAll(secretToken, in: out) { _ in "[REDACTED-SECRET]" }
-        out = replaceAll(pem, in: out) { _ in "[REDACTED-KEY]" }
-        out = replaceAll(uuid, in: out) { _ in "[REDACTED-ID]" }
-        out = replaceAll(ipv4, in: out) { _ in "[REDACTED-IP]" }
+        out = replaceAll(Patterns.emailRe, in: out) { _ in "[REDACTED-EMAIL]" }
+        out = replaceAll(Patterns.ssnRe, in: out) { _ in "[REDACTED-SSN]" }
+        out = replaceAll(Patterns.phoneRe, in: out) { _ in "[REDACTED-PHONE]" }
+        out = replaceAll(Patterns.secretTokenRe, in: out) { _ in "[REDACTED-SECRET]" }
+        out = replaceAll(Patterns.pemBlockRe, in: out) { _ in "[REDACTED-KEY]" }
+        out = replaceAll(Patterns.uuidRe, in: out) { _ in "[REDACTED-ID]" }
+        out = replaceAll(Patterns.ipv4Re, in: out) { _ in "[REDACTED-IP]" }
         return out
     }
 
@@ -215,6 +196,12 @@ enum Redact {
             return out
         }
         if let arr = v as? [Any] { return arr.map { redactJSON($0) } }
+        // A card number sent as a JSON NUMBER → mask as a STRING here, in the typed walk.
+        // Otherwise the later scrubValues pass rewrites the bare number to a bareword token
+        // in a numeric slot → invalid JSON → downstream drops the ENTIRE event.
+        if let n = v as? NSNumber, !isBool(n), !CFNumberIsFloatType(n), Patterns.looksLikePan(String(abs(n.int64Value))) {
+            return "[REDACTED-PAN]"
+        }
         return v
     }
 

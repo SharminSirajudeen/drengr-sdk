@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Batches captured signals and ships them to the Drengr ingest endpoint,
 /// authenticated by a publishable key. Port of the proven Dart/JS/Kotlin
@@ -32,8 +33,12 @@ final class IngestSink {
     private var externalId: String?
     private var experimentsMap: [String: String] = [:]
 
+    // On-device sealing config. nil = fail-closed: PII ships as typed placeholders,
+    // never raw. Mutated/read only on `queue`.
+    private var vault: VaultConfig?
+
     // Delivery session WITHOUT the Drengr protocol → invisible to capture.
-    private let delivery: URLSession
+    let delivery: URLSession
 
     init(url: URL, publishableKey: String, context: [String: Any],
          maxBatch: Int = 50, maxQueue: Int = 500, flushInterval: TimeInterval = 10,
@@ -58,8 +63,38 @@ final class IngestSink {
     }
 
     func addNetwork(_ e: NetworkEvent) {
-        let ev = toNet(e)
-        queue.async { [weak self] in self?.enqueue(ev) }
+        let (ev, pii) = toNet(e)
+        queue.async { [weak self] in self?.ingest(ev, pii: pii) }
+    }
+
+    /// Activate (or clear) on-device sealing after the org's signed config verifies.
+    /// Until set, the sink is fail-closed: PII ships as placeholders, never raw.
+    func setVault(_ v: VaultConfig?) {
+        queue.async { [weak self] in self?.vault = v }
+    }
+
+    // Seal captured PII into the event when a vault is set, else fail-closed. Mirrors
+    // the JS sealAndEnqueue: attach subject_hash + the HPKE envelope as `pii`.
+    private func ingest(_ event: [String: Any], pii: [String: String]) {
+        var event = event
+        if let v = vault, !pii.isEmpty { sealInto(&event, pii: pii, vault: v) }
+        enqueue(event)
+    }
+
+    private func sealInto(_ event: inout [String: Any], pii: [String: String], vault: VaultConfig) {
+        let sh = externalId.map { Identity.subjectHash(pepper: vault.orgPepper, externalId: $0) } ?? ""
+        if !sh.isEmpty { event["subject_hash"] = sh }
+        let bh = sha256hex((event["req_body"] as? String ?? "") + "|" + (event["body"] as? String ?? ""))
+        guard #available(iOS 17, macOS 14, tvOS 17, *) else { return }
+        let ctx = SealContext(subjectHash: sh, sealUlid: event["event_id"] as? String ?? "",
+                              bodyHash: bh, tenantId: vault.tenantId)
+        if let env = Seal.sealPii(pii, ctx: ctx, orgPubKey: vault.orgPubKey, kid: vault.kid) {
+            event["pii"] = ["pii_alg": env.pii_alg, "kid": env.kid, "enc": env.enc, "ct": env.ct]
+        }
+    }
+
+    private func sha256hex(_ s: String) -> String {
+        SHA256.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Enqueue an already-redacted semantic tap (kind "tap" — ingest-allowlisted).
@@ -68,6 +103,7 @@ final class IngestSink {
             "kind": "tap",
             "event_id": randomID(),
             "ts_ms": e.timestampMs,
+            "screen": e.screen,
             "label": e.label ?? "",
             "label_source": e.labelSource,
             "role": e.role,
@@ -77,6 +113,53 @@ final class IngestSink {
         ]
         if let v = e.value { o["value"] = v }
         queue.async { [weak self] in self?.enqueue(o) }
+    }
+
+    /// Enqueue a pre-built behavior event (screen_view / rage_tap / dead_tap /
+    /// crash — already redacted by the capture layer). Fills event_id/ts_ms
+    /// when absent, mirroring the Flutter sink. Fail-open.
+    func addBehavior(_ ev: [String: Any]) {
+        var o = ev
+        if o["event_id"] == nil { o["event_id"] = randomID() }
+        if o["ts_ms"] == nil { o["ts_ms"] = Int64(Date().timeIntervalSince1970 * 1000) }
+        queue.async { [weak self] in self?.enqueue(o) }
+    }
+
+    /// app_foreground: process entered the foreground on `screen`. Lets the
+    /// backend subtract backgrounded gaps when computing true screen dwell.
+    /// Mirrors Android `IngestSink.addAppForeground`.
+    func addAppForeground(_ screen: String) { addLifecycle("app_foreground", screen: screen) }
+
+    /// app_background: process left the foreground on `screen`.
+    func addAppBackground(_ screen: String) { addLifecycle("app_background", screen: screen) }
+
+    private func addLifecycle(_ kind: String, screen: String) {
+        var o: [String: Any] = [
+            "kind": kind,
+            "event_id": randomID(),
+            "ts_ms": Int64(Date().timeIntervalSince1970 * 1000),
+        ]
+        if !screen.isEmpty { o["screen"] = screen }
+        queue.async { [weak self] in self?.enqueue(o) }
+    }
+
+    /// Crash-path enqueue: waits (bounded) until the event is queued AND
+    /// persisted to disk, so the imminent process death can't lose it. The
+    /// timeout guarantees a wedged queue can never turn a crash into a hang.
+    func addCrashSync(_ ev: [String: Any], timeout: TimeInterval = 1.0) {
+        var o = ev
+        if o["event_id"] == nil { o["event_id"] = randomID() }
+        if o["ts_ms"] == nil { o["ts_ms"] = Int64(Date().timeIntervalSince1970 * 1000) }
+        let sem = DispatchSemaphore(value: 0)
+        queue.async { [weak self] in
+            if let self = self {
+                self.events.append(o)
+                while self.events.count > self.maxQueue { self.events.removeFirst() }
+                self.persist()
+            }
+            sem.signal()
+        }
+        _ = sem.wait(timeout: .now() + timeout)
     }
 
     /// Sets external_id (all events hereafter) and emits one identify event;
@@ -135,7 +218,7 @@ final class IngestSink {
         }
     }
 
-    private func toNet(_ e: NetworkEvent) -> [String: Any] {
+    private func toNet(_ e: NetworkEvent) -> ([String: Any], [String: String]) {
         let status = e.statusCode ?? 0
         let failed = e.errorText != nil || status >= 400
         var o: [String: Any] = [
@@ -151,13 +234,18 @@ final class IngestSink {
             "resp_bytes": e.responseBodyBytes,
         ]
         // Seal-by-default classifier: free-text PII that value-scrubbing can't
-        // pattern-match seals to a typed placeholder instead of shipping. piiMap is
-        // collected for the future encrypt layer, not shipped — projection is leak-free.
-        if let rb = Classify.classifyBody(e.requestBody).projection { o["req_body"] = rb }
-        if let sb = Classify.classifyBody(e.responseBody).projection { o["body"] = sb }
+        // pattern-match seals to a typed placeholder in the projection; the raw value
+        // goes to piiMap for HPKE sealing (see sealInto). projection is leak-free.
+        let reqC = Classify.classifyBody(e.requestBody)
+        let respC = Classify.classifyBody(e.responseBody)
+        var pii: [String: String] = [:]
+        for (k, v) in reqC.piiMap { pii["req." + k] = v }
+        for (k, v) in respC.piiMap { pii["resp." + k] = v }
+        if let rb = reqC.projection { o["req_body"] = rb }
+        if let sb = respC.projection { o["body"] = sb }
         o["req_headers"] = capHeaders(e.requestHeaders)
         o["resp_headers"] = capHeaders(e.responseHeaders)
-        return o
+        return (o, pii)
     }
 
     /// Cap the already-redacted header map: 48 entries max; oversized serialization → {}.

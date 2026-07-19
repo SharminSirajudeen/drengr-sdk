@@ -7,6 +7,10 @@ public struct TapEvent {
     public let value: String?
     public let role: String          // button | link | text_input | adjustable | image | text | view
     public let elementClass: String
+    /// Screen the tap landed on (maintained by screen_view capture; may be "").
+    public let screen: String
+    /// Whether anything on the hit path handles taps (false → dead_tap).
+    public let interactive: Bool
     /// Normalized 0–1 within the window.
     public let x: Double
     public let y: Double
@@ -18,17 +22,22 @@ enum TapResolve {
     static let maxLabelChars = 256
     static let maxValueChars = 128
 
-    static func event(hit: AXHit?, fallbackClass: String, x: Double, y: Double, tsMs: Int64) -> TapEvent {
+    static let interactiveTraits: AXTraitFlags = [.button, .link, .adjustable, .textEntry]
+
+    static func event(hit: AXHit?, fallbackClass: String, x: Double, y: Double, tsMs: Int64,
+                      screen: String = "", pathInteractive: Bool = false) -> TapEvent {
         guard let h = hit else {
             return TapEvent(label: nil, labelSource: "class_fallback", value: nil, role: "view",
-                            elementClass: fallbackClass, x: x, y: y, timestampMs: tsMs)
+                            elementClass: fallbackClass, screen: screen,
+                            interactive: pathInteractive, x: x, y: y, timestampMs: tsMs)
         }
         let ident = h.identifier.flatMap { safeLabel($0) }
         let lbl = h.label.flatMap { safeLabel($0) }
         let source = ident != nil ? "identifier" : (lbl != nil ? "accessibility_label" : "class_fallback")
         return TapEvent(label: ident ?? lbl, labelSource: source,
                         value: safeValue(h.value, label: h.label, traits: h.traits),
-                        role: role(h.traits), elementClass: h.className,
+                        role: role(h.traits), elementClass: h.className, screen: screen,
+                        interactive: pathInteractive || !h.traits.intersection(interactiveTraits).isEmpty,
                         x: x, y: y, timestampMs: tsMs)
     }
 

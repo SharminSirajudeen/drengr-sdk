@@ -42,17 +42,24 @@ public enum Drengr {
     /// - Parameters:
     ///   - maxBodyBytes: cap on captured body size (default 64 KiB).
     ///   - startEnabled: false installs paused (consent gate); call `setEnabled`.
+    ///   - behavior: default ON — captures screen_view (viewDidAppear swizzle),
+    ///     taps with semantic labels, rage/dead taps, and crashes with zero
+    ///     per-screen code; pass `false` to opt out of behavior autocapture.
     ///   - captureWhen: optional per-URL predicate (sampling / allow-listing).
     ///   - redactHeaders: extra header names to mask (lowercased), on top of defaults.
+    ///   - vault: E2EE PII vault pin; sealing stays off until the org's signed
+    ///     config is fetched and verifies against it (fail-closed).
     public static func start(
         publishableKey: String,
         ingestURL: String,
         appPackage: String,
         maxBodyBytes: Int = 64 * 1024,
         startEnabled: Bool = true,
+        behavior: Bool = true,
         captureWhen: ((String) -> Bool)? = nil,
         redactHeaders: Set<String> = [],
-        extraContext: [String: Any] = [:]
+        extraContext: [String: Any] = [:],
+        vault: VaultOptions? = nil
     ) {
         lock.lock(); defer { lock.unlock() }
         if installed { return }
@@ -87,22 +94,65 @@ public enum Drengr {
         ))
         installLifecycleObservers()
         installed = true
+
+        if behavior { installBehaviorCapture(sink: s) }
+
+        if let v = vault {
+            VaultActivation.configure(sink: s, options: v, ingestURL: ingestURL,
+                                      publishableKey: publishableKey, session: s.delivery)
+        }
     }
 
-    /// EXPERIMENTAL: semantic tap capture (SwiftUI + UIKit). Observes taps via a
-    /// restore-safe UIWindow.sendEvent swizzle and resolves labels from the
-    /// accessibility tree (SwiftUI projects Button/Text semantics there).
-    /// Fail-open; labels/values are redacted; events flow once start() has run.
-    public static func experimentalSwiftUITapCapture() {
+    /// Behavior autocapture (default ON via start): taps + rage/dead taps,
+    /// screen_view, and crash — all through the sink's redacted event path.
+    /// Also drains crash events a previous run's signal handler persisted.
+    private static func installBehaviorCapture(sink s: IngestSink) {
+        #if canImport(UIKit) && !os(watchOS)
+        installTapCapture()
+        ScreenViewCapture.install(config: ScreenViewCapture.Config(
+            onEvent: { ev in
+                lock.lock(); let s = sink; let t = tracker; lock.unlock()
+                s?.addBehavior(ev); t?.touch()
+            },
+            isEnabled: { enabledFlag() }
+        ))
+        #endif
+        // The crash closure captures the sink directly: at crash time it must
+        // never contend for Drengr's lock (a wedged lock would hang the crash).
+        CrashCapture.install(config: CrashCapture.Config(
+            onCrash: { ev in
+                s.addCrashSync(ev)
+                let sem = DispatchSemaphore(value: 0)
+                s.forceFlush { sem.signal() }
+                _ = sem.wait(timeout: .now() + 2)   // bounded: never turn a crash into a hang
+            }
+        ))
+        CrashCapture.setEnabled(enabled)   // start() holds the lock — read the flag directly
+        CrashCapture.drainPending(into: s)
+    }
+
+    private static func installTapCapture() {
         #if canImport(UIKit) && !os(watchOS)
         TapCapture.install(config: TapCapture.Config(
             onEvent: { e in
                 lock.lock(); let s = sink; let t = tracker; lock.unlock()
                 s?.addTap(e); t?.touch()
             },
+            onBehavior: { ev in
+                lock.lock(); let s = sink; let t = tracker; lock.unlock()
+                s?.addBehavior(ev); t?.touch()
+            },
             isEnabled: { enabledFlag() }
         ))
         #endif
+    }
+
+    /// Deprecated: tap capture is ON BY DEFAULT in `start` (behavior: true).
+    /// Kept for source compatibility; still installs when start(behavior: false)
+    /// was used.
+    @available(*, deprecated, message: "Tap capture is on by default in start(); this call is no longer needed.")
+    public static func experimentalSwiftUITapCapture() {
+        installTapCapture()
     }
 
     /// Force-send all queued events now; `completion` fires when the attempt finishes.
@@ -130,7 +180,7 @@ public enum Drengr {
     }
 
     static func onForeground() {
-        lock.lock(); let t = tracker; let s = sink; lock.unlock()
+        lock.lock(); let t = tracker; let s = sink; let en = enabled; lock.unlock()
         guard let t = t else { return }
         if t.isStale() {
             let newId = t.rotate()
@@ -138,11 +188,19 @@ public enum Drengr {
         } else {
             t.touch()
         }
+        // Foreground marker so the backend can subtract backgrounded time from
+        // screen dwell (accurate dwell is the make-or-break signal). Mirrors
+        // Android onActivityStarted; rides under the new session id after rotation.
+        if en { s?.addAppForeground(ScreenState.screen) }
     }
 
     static func onBackground() {
-        lock.lock(); let t = tracker; let s = sink; lock.unlock()
+        lock.lock(); let t = tracker; let s = sink; let en = enabled; lock.unlock()
         t?.touch()
+        // Emit BEFORE the flush so the background marker rides the same batch
+        // (both hop the sink's serial queue in FIFO order). Mirrors Android
+        // onActivityStopped: app_background, then flush.
+        if en { s?.addAppBackground(ScreenState.screen) }
         s?.forceFlush()
     }
 
@@ -164,6 +222,7 @@ public enum Drengr {
     /// Pause/resume capture (consent gate). Delivery of buffered events continues.
     public static func setEnabled(_ value: Bool) {
         lock.lock(); enabled = value; lock.unlock()
+        CrashCapture.setEnabled(value)
     }
 
     /// Persistently opt this install OUT of capture (GDPR). Unlike setEnabled(false),
